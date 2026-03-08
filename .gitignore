@@ -1,0 +1,5 @@
+./checkpoints
+merged_financial_data_news.csv
+__pycache__/
+.ipynb_checkpoints/
+lstm_stock_predictor_norm_2lstm_tsip.keras

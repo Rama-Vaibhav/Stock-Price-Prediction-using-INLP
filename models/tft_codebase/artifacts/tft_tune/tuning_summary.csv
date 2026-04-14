@@ -1,4 +1,0 @@
-window,study_name,study_db,n_trials_total,best_val_loss,best_trial_number
-10,tft_tune_w10,artifacts/tft_tune/window_10/study.db,20,0.007111534476280212,14
-15,tft_tune_w15,artifacts/tft_tune/window_15/study.db,20,0.006997050251811743,4
-30,tft_tune_w30,artifacts/tft_tune/window_30/study.db,20,0.0070101553574204445,7

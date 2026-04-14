@@ -1,9 +1,0 @@
-{
-  "best_ckpt": "/home/mveen/Desktop/S26/INLP/root/artifacts/tft/window_7/checkpoints/best-epoch003-valloss0.007146.ckpt",
-  "completed_at": "2026-04-10T13:08:38Z",
-  "metrics_path": "artifacts/tft/window_7/metrics.csv",
-  "prediction_audit_path": "artifacts/tft/window_7/test_predictions.csv",
-  "status": "completed",
-  "updated_at": "2026-04-10T13:08:38Z",
-  "window": 7
-}

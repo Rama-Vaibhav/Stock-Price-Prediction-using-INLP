@@ -1,0 +1,22 @@
+{
+  "best_params": {
+    "attention_head_size_v2": 1,
+    "dropout": 0.11356818667316143,
+    "gradient_clip_val": 0.39279729768693794,
+    "hidden_continuous_size_v2": 8,
+    "hidden_size_v2": 32,
+    "learning_rate": 0.0012399967836846098
+  },
+  "best_trial_number": 4,
+  "best_user_attrs": {
+    "best_checkpoint": "/home/mveen/Desktop/S26/INLP/root/artifacts/tft_tune/window_15/trials/trial_00004/checkpoints/best-epoch003-valloss0.006997.ckpt",
+    "effective_attention_head_size": 1,
+    "effective_hidden_continuous_size": 8,
+    "effective_hidden_size": 32,
+    "effective_precision": "16-mixed"
+  },
+  "best_val_loss": 0.006997050251811743,
+  "study_db": "artifacts/tft_tune/window_15/study.db",
+  "updated_at": "2026-04-10T07:01:31Z",
+  "window": 15
+}

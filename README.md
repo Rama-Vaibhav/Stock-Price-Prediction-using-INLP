@@ -1,250 +1,157 @@
-# Stock Price Prediction Using NLP (FinBERT + LSTM)
+# INLP Stock Price Prediction Project
 
-A deep learning pipeline that predicts **Nifty 50 closing prices** by combining historical OHLCV data with **news sentiment** extracted via **FinBERT**. The project scrapes financial news, computes sentiment scores, engineers time-series features, and trains a stacked LSTM model with Bayesian-optimised hyperparameters.
+This repository contains a modular pipeline for Nifty stock forecasting using news + market data, plus multiple model tracks (TFT, GRU, LSTM, and an ensemble).
 
----
+## What We Are Trying To Do
 
-## Table of Contents
+The core goal of this project is to predict short-term stock movement for Nifty-listed companies by combining:
+- market price history (OHLCV-based signals),
+- financial news context (direct, sectoral, and global impact), and
+- sentiment intelligence from language models.
 
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Project Structure](#project-structure)
-- [Data Pipeline](#data-pipeline)
-- [Model Details](#model-details)
-- [Setup & Installation](#setup--installation)
-- [Usage](#usage)
-- [Results](#results)
-- [License](#license)
+In practice, we transform raw scraped data into a unified modeling dataset (`tft_ready.csv`), train multiple forecasting models, compare their performance, and then use an ensemble to improve robustness.
 
----
+In exact terms, the forecasting setup uses various past windows (`7`, `10`, `15`, `30` days) to predict the **next-day Adjusted Close price**.
 
-## Overview
+## Root-Level Items
 
-| Aspect | Details |
+| Item | Purpose |
 |---|---|
-| **Market** | NSE Nifty 50 (50 stocks) |
-| **Date Range** | January 2023 – February 2026 |
-| **News Source** | Financial Express (Business & Market sections) |
-| **Sentiment Model** | [ProsusAI/FinBERT](https://huggingface.co/ProsusAI/finbert) |
-| **Prediction Model** | Stacked 2-layer LSTM (TensorFlow/Keras) |
-| **HP Tuning** | Bayesian Optimisation via Keras Tuner |
-| **Prediction Target** | Next-day closing price per ticker |
+| `README.md` | Main project documentation (this file). |
+| `dataset/` | Active root datasets used by feature engineering and model training. |
+| `models/` | Model-specific code, notebooks, outputs, and model READMEs. |
+| `src/` | Main data pipeline scripts and web/data scrapers. |
+| `archive/` | Deprecated legacy assets retained only for historical traceability; not part of the active workflow. |
 
----
+## Current Directory Structure
 
-## Architecture
-
-```
-Financial Express  ──►  Web Scraper  ──►  Cleaned News CSV
-                                              │
-                                         FinBERT Sentiment
-                                         (pos / neg / neu)
-                                              │
-Yahoo Finance  ──►  OHLCV Extractor  ──►  Merged Dataset  ──►  LSTM  ──►  Predicted Close
-(Nifty 50)          (yfinance)            (prices + sentiment)
-```
-
-1. **Scrape** financial news articles (multi-threaded).
-2. **Clean & preprocess** text and price data.
-3. **Score sentiment** per day using FinBERT (GPU-accelerated, sliding-window batched inference).
-4. **Merge** daily sentiment scores with per-ticker OHLCV data.
-5. **Engineer features**: 10-day lagged features for Close, Open, High, Low, Volume, and sentiment scores.
-6. **Train** a 2-layer LSTM with tuned hyperparameters; evaluate on a chronological test split.
-
----
-
-## Project Structure
-
-```
-├── financial_express_scraper.py       # Multi-threaded news scraper (Financial Express)
-├── nifty50_yfinance_extractor.py      # Downloads Nifty 50 OHLCV data via yfinance
-├── preprocessor.py                    # 4-phase preprocessing pipeline (merge, clean, features, calendar)
-├── finBERT_Sen_Final.ipynb            # FinBERT sentiment analysis → merged dataset
-├── pred_LSTM_final.ipynb              # Final LSTM training, evaluation & visualisation
-├── HPT_10days.ipynb                   # Hyperparameter tuning (10-day window, Bayesian Opt.)
-├── HPT_7-15-30Days.ipynb              # Hyperparameter tuning across 7/15/30-day windows
-├── cleaned_news.csv                   # Pre-cleaned news articles
-├── nifty50_historical_prices.csv      # Raw Nifty 50 OHLCV data
-├── merged_financial_data_news.csv     # Final merged dataset (prices + sentiment)
-├── lstm_stock_predictor_norm_2lstm_tsip.keras  # Trained LSTM model weights
-├── checkpoints/
-│   └── best_lstm.keras                # Best checkpoint from training
-└── Old/                               # Earlier experimental notebooks
+```text
+.
+├── dataset/
+│   ├── news_sentiment.csv
+│   ├── nifty50_ticker.csv
+│   └── tft_ready.csv
+├── models/
+│   ├── ENSEMBLED MODEL/
+│   │   ├── ensemble_learner_final.ipynb
+│   │   └── ensemble_outputs/
+│   ├── GRU/
+│   │   ├── gru_stock_prediction.ipynb
+│   │   └── GRU_outputs/
+│   ├── LSTM/
+│   │   ├── lstm_stock_prediction.ipynb
+│   │   ├── checkpoints/
+│   │   └── lstm_outputs/
+│   └── TFT/
+│       ├── src/
+│       │   ├── 4_tft_hpt_train_test.py
+│       │   └── 5_tft_visualize.py
+│       ├── dataset/
+│       ├── artifacts/
+│       └── README.md
+├── src/
+│   ├── 0_preprocess_news.py
+│   ├── 1_qwen_news_segregation.py
+│   ├── 2_finbert_sentiment.py
+│   ├── 3_feature_engineering.py
+│   └── scrapers/
+│       ├── businessstandard_scraper.py
+│       ├── economictimes_scraper.py
+│       ├── financialexpress_scraper.py
+│       ├── moneycontrol_scraper.py
+│       └── nifty_yfinance_scraper.py
+└── README.md
 ```
 
----
+## Dataset Brief
 
-## Data Pipeline
+This snapshot includes processed datasets needed for modeling, while most raw/intermediate files from the original full pipeline are not included.
 
-### 1. News Scraping (`financial_express_scraper.py`)
+Available now:
+- `dataset/news_sentiment.csv` (125,511 rows)
+- `dataset/nifty50_ticker.csv` (74,439 rows)
+- `dataset/tft_ready.csv` (71,939 rows)
 
-- Scrapes the **Business** and **Market** sections of Financial Express.
-- Uses 20 concurrent threads with retry logic.
-- Extracts article date, title, body, author, and URL.
-- Date range: **Sep 1, 2025 – Feb 28, 2026**.
+Column highlights:
+- `news_sentiment.csv`: date/symbol + sentiment probabilities and article counts for direct, sectoral, global news.
+- `nifty50_ticker.csv`: OHLCV and corporate-action columns per symbol/date.
+- `tft_ready.csv`: engineered market + sentiment features, `target_pct_change`, and `time_idx`.
 
-### 2. Price Extraction (`nifty50_yfinance_extractor.py`)
+If you need the full raw-to-final flow context (including files not present in this snapshot), use `README copy.md` as the reference.
 
-- Downloads daily OHLCV + Adj Close for all **50 Nifty 50 tickers** via `yfinance`.
-- Covers **Jan 1, 2023 – Feb 28, 2026**.
-- Outputs a flat CSV with columns: `Date, Ticker, Open, High, Low, Close, Adj Close, Volume`.
+## Environment and Dependency Installation
 
-### 3. Preprocessing (`preprocessor.py`)
-
-A 4-phase crash-resilient pipeline:
-
-| Phase | Description | Output |
-|---|---|---|
-| **Phase 1** | Merge raw `*_news.csv` files, normalize columns, deduplicate by URL | `combined_market_news.csv` |
-| **Phase 2** | HTML decode, remove boilerplate, filter short articles, enforce date range | `cleaned_news.csv` |
-| **Phase 3** | Holiday/stale-row removal, sector tagging, 13 technical indicators per ticker | `cleaned_prices.csv`, `price_features.csv` |
-| **Phase 4** | Trading calendar, daily news volume computation | `trading_calendar.csv`, `daily_news_volume.csv` |
-
-### 4. Sentiment Analysis (`finBERT_Sen_Final.ipynb`)
-
-- Loads `cleaned_news.csv`; cleans text (lowercase, remove punctuation, lemmatize, drop stopwords) using multiprocessing.
-- Concatenates all articles per day into a single document.
-- Runs **ProsusAI/FinBERT** with a sliding-window strategy (window=512, stride=256) and batched GPU inference (FP16).
-- Produces per-day `pos_score`, `neg_score`, `neu_score`.
-- Left-joins sentiment scores with `nifty50_historical_prices.csv` → outputs `merged_financial_data_news.csv`.
-
----
-
-## Model Details
-
-### Features
-
-| Feature Type | Columns |
-|---|---|
-| **Price** | Open, High, Low, Close, Volume |
-| **Sentiment** | pos_score, neg_score, neu_score |
-| **Ticker** | ticker_scaled (MinMax-encoded ticker ID) |
-| **Lagged** | 10-day lags for each of the 8 features above |
-
-Total input per sample: **11 timesteps × 9 features** (reshaped for LSTM).
-
-### LSTM Architecture
-
-```
-Input (11 × 9)
-    │
-LSTM (64 units, return_sequences=True)
-    │
-Dropout (0.3)
-    │
-LSTM (32 units)
-    │
-Dropout (0.3)
-    │
-Dense (64, ReLU)
-    │
-Dense (1) → Predicted Close Price
-```
-
-### Hyperparameter Tuning
-
-Bayesian Optimisation (Keras Tuner, 20 trials) explored:
-
-| Hyperparameter | Search Space | Best Value |
-|---|---|---|
-| `lstm_units_1` | {64, 128, 256} | 64 |
-| `lstm_units_2` | {32, 64, 128} | 32 |
-| `dropout_rate` | 0.1 – 0.5 | 0.3 |
-| `dense_units` | {16, 32, 64} | 64 |
-| `learning_rate` | 1e-4 – 1e-2 (log) | 0.0021 |
-
-### Training Configuration
-
-- **Loss**: MSE
-- **Optimizer**: Adam (lr = 0.0021)
-- **Batch size**: 64
-- **Max epochs**: 120 (EarlyStopping patience=15)
-- **LR scheduler**: ReduceLROnPlateau (factor=0.5, patience=7)
-- **Data split**: 80/10/10 (train/val/test, chronological)
-- **Seed**: 32 (reproducible)
-
----
-
-## Setup & Installation
-
-### Prerequisites
-
-- Python 3.10+
-- Conda (recommended) or pip
-- NVIDIA GPU with CUDA (optional, for faster training & inference)
-
-### Environment Setup
+Per project policy, use the conda environment `inlp_project`.
 
 ```bash
-# Create and activate conda environment
-conda create -n ml python=3.10 -y
-conda activate ml
-
-# Core dependencies
-conda install pandas numpy scikit-learn matplotlib seaborn -c conda-forge
-conda install -c conda-forge yfinance
-conda install requests beautifulsoup4
-
-# Deep learning
-pip install tensorflow[and-cuda]    # or: conda install tensorflow-gpu
-pip install transformers
-pip install keras-tuner
-
-# NLP
-pip install nltk torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+conda activate inlp_project
 ```
 
----
+Install in priority order.
 
-## Usage
-
-### 1. Scrape News
+1. Conda defaults first:
 
 ```bash
-conda activate ml
-python financial_express_scraper.py
+conda install -y numpy pandas scipy scikit-learn matplotlib tqdm requests aiohttp beautifulsoup4 lxml selenium python-dotenv
 ```
 
-### 2. Download Price Data
+2. Then conda-forge for missing packages:
 
 ```bash
-python nifty50_yfinance_extractor.py
+conda install -y -c conda-forge yfinance ta transformers lightning pytorch-forecasting optuna optuna-integration curl_cffi jupyterlab
 ```
 
-### 3. Run Preprocessing
+3. PyTorch (CUDA stack):
 
 ```bash
-python preprocessor.py              # full pipeline
-python preprocessor.py --skip-merge  # skip Phase 1 if already merged
-python preprocessor.py --force       # re-run all steps
+conda install -y -c pytorch -c nvidia pytorch torchvision torchaudio pytorch-cuda=11.8
 ```
 
-### 4. Generate Sentiment Scores
+4. Pip only if still unavailable via conda channels:
 
-Open and run all cells in **`finBERT_Sen_Final.ipynb`**. This produces `merged_financial_data_news.csv`.
+```bash
+pip install ollama
+```
 
-### 5. Train the LSTM Model
+## `src/` Files: Purpose and Commands
 
-Open and run all cells in **`pred_LSTM_final.ipynb`**. The trained model is saved to `lstm_stock_predictor_norm_2lstm_tsip.keras`.
+### Core pipeline scripts
 
-### 6. Hyperparameter Tuning
+| File | What it does | Main output | Run command |
+|---|---|---|---|
+| `src/0_preprocess_news.py` | Merges all `dataset/raw_dataset/*_raw.csv`, cleans/deduplicates text, filters date range, sorts chronologically. | `dataset/processed_news_dataset.csv` | `python src/0_preprocess_news.py` |
+| `src/1_qwen_news_segregation.py` | Uses Ollama Qwen to split news into direct/sectoral/global impact with checkpoint/retry support. | `dataset/tier_segregated_news.csv` | `python src/1_qwen_news_segregation.py` |
+| `src/2_finbert_sentiment.py` | Runs FinBERT sentiment scoring (with unique-text caching and sliding windows). | `dataset/news_sentiment.csv` | `python src/2_finbert_sentiment.py` |
+| `src/3_feature_engineering.py` | Merges ticker + sentiment data, adds technical features, scales per symbol, builds modeling table. | `dataset/tft_ready.csv` | `python src/3_feature_engineering.py` |
 
-- **10-day window**: `HPT_10days.ipynb`[Got best hyperparameter from this]
-- **7/15/30-day windows**: `HPT_7-15-30Days.ipynb`
+Notes:
+- `1_qwen_news_segregation.py` is menu-driven: `1` NER only, `2` CSV only, `3` full pipeline.
+- For Qwen segregation, run Ollama first:
+  - `ollama serve`
+  - `ollama pull qwen2.5:3b`
+- `2_finbert_sentiment.py` currently expects `dataset/tier_segragated_news.csv` (filename typo in script constant). Ensure the expected input filename exists before running.
 
----
+### Scraper files
 
-## Results
+| File | What it does | Main output | Run command |
+|---|---|---|---|
+| `src/scrapers/moneycontrol_scraper.py` | Async scraper (curl_cffi TLS impersonation) for Moneycontrol news pages with checkpoint resume. | `dataset/raw_dataset/moneycontrol_raw.csv` | `python src/scrapers/moneycontrol_scraper.py` |
+| `src/scrapers/financialexpress_scraper.py` | Async + process-pool scraper for Financial Express sections with robust checkpointing. | `dataset/raw_dataset/financialexpress_raw.csv` | `python src/scrapers/financialexpress_scraper.py` |
+| `src/scrapers/economictimes_scraper.py` | Sitemap-driven historical Economic Times scraper (`/markets/stocks/news/`) with dedup checkpoints. | `dataset/raw_dataset/economictimes_raw.csv` | `python src/scrapers/economictimes_scraper.py` |
+| `src/scrapers/businessstandard_scraper.py` | Hybrid scraper: curl_cffi for listing pages + Selenium for JS-rendered article pages. | `dataset/raw_dataset/businessstandard_raw.csv` | `python src/scrapers/businessstandard_scraper.py` |
+| `src/scrapers/nifty_yfinance_scraper.py` | Downloads Nifty constituent OHLCV data (Nifty50/100/200/all) from Yahoo Finance with resume support. | `dataset/stock_dataset/<index>_ticker.csv` | `python src/scrapers/nifty_yfinance_scraper.py --index nifty50 --start 2020-01-01 --end 2026-03-31` |
 
-The final model is evaluated on a chronological test set with the following metrics:
+`nifty_yfinance_scraper.py` also supports interactive mode if run without CLI arguments.
 
-- **MSE** (Mean Squared Error)
-- **MAE** (Mean Absolute Error)
-- **RMSE** (Root Mean Squared Error)
-- **MAPE** (Mean Absolute Percentage Error) — computed per ticker
+## Models Overview
 
-The notebooks produce:
-- Actual vs. Predicted close price plots (full test set)
-- Per-ticker MAPE rankings
-- Top-5 lowest-MAPE stock visualisations with individual subplots
+- `models/TFT/`: Temporal Fusion Transformer pipeline (tuning, training/testing, inference, visualizations).
+- `models/GRU/`: GRU quantile forecasting notebook with multi-window experiments and evaluation artifacts.
+- `models/LSTM/`: LSTM quantile forecasting notebook with multi-window experiments and evaluation artifacts.
+- `models/ENSEMBLED MODEL/`: Stacking ensemble notebook combining LSTM + GRU + TFT outputs using meta-learners.
 
+Detailed setup and usage for each model are documented inside each model folder:
+- `models/TFT/README.md`
+- `models/GRU/README.md`
+- `models/LSTM/README.md`
+- `models/ENSEMBLED MODEL/README.md`

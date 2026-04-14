@@ -1,833 +1,917 @@
 #!/usr/bin/env python3
 """
-Unified TFT pipeline: Hyperparameter tuning + training/testing + inference.
+TFT pipeline for Nifty50 multi-series forecasting.
 
-This script combines the existing optimized flows from:
-- src/4_tft_train_test.py
-- src/5_tft_tune.py
 
-Design intent:
-- Preserve model/data/evaluation logic from existing scripts.
-- Keep artifact locations unchanged:
-  - tuning artifacts: artifacts/tft_tune/...
-  - training/inference artifacts: artifacts/tft/...
-- Provide one top-level interactive mode menu.
+Sections
+--------
+1. Imports  (stdlib → third-party)
+
+2. SHARED CONSTANTS & UTILITIES
+   Date/column names, split boundaries, batch-size map, metric column list.
+   configure_logging, configure_warnings, set_seed, ensure_dir, parse_windows,
+   choose_windows_menu, now_utc_iso, read_json, write_json,
+   find_latest_checkpoint, to_numpy, safe_div, compute_regression_metrics,
+   compute_mape, compute_direction_metrics, load_and_prepare_dataframe,
+   get_split_masks, choose_model_features, filter_eligible_symbols,
+   build_datasets_for_window, unpack_prediction_output, find_symbol_col,
+   find_time_col, build_truth_and_price_matrices.
+
+3. TRAINING & TESTING
+   WindowStateCallback, RunConfig, compute_window_metrics,
+   save_prediction_audit, evaluate_window_and_write_outputs,
+   run_window_training.
+
+4. HYPERPARAMETER TUNING
+   TuneConfig, pick_precision_sequence, pick_loader_workers, is_probable_oom,
+   is_probable_bf16_issue, compute_per_symbol_equal_direction_metrics,
+   WindowObjective, export_trials_csv, print_window_summary, tune_window.
+
+5. UNIFIED CONFIG
+   UnifiedConfig dataclass merging all RunConfig and TuneConfig fields.
+   make_run_config (builds RunConfig with optional per-window HP overrides),
+   make_tune_config, load_tuned_hps_for_window.
+
+6. CLI & MAIN
+   build_arg_parser, make_unified_config, show_main_menu,
+   run_tuning_mode, run_train_test_mode, run_inference_only_mode, main.
+   if __name__ == "__main__": main()
+
+Interactive top-level menu
+--------------------------
+  [0] Hyperparameter tuning  → then training/testing
+  [1] Training/testing only  (loads tuned HPs when available)
+  [2] Inference only
+  [3] Exit
 """
 
 from __future__ import annotations
 
+# ── stdlib ──────────────────────────────────────────────────────────────────
 import argparse
-import atexit
-import base64
-import importlib.util
+import gc
+import json
 import logging
 import os
-import shutil
+import random
+import signal
 import sys
-import tempfile
 import traceback
-import zlib
+import warnings
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+# ── third-party ──────────────────────────────────────────────────────────────
+import numpy as np
 import pandas as pd
 import torch
+from sklearn.metrics import f1_score, precision_score, recall_score
 from tqdm.auto import tqdm
 
+try:
+    import lightning.pytorch as pl
+    from lightning.pytorch.callbacks import (
+        Callback,
+        EarlyStopping,
+        ModelCheckpoint,
+        TQDMProgressBar,
+    )
+    from lightning.pytorch.loggers import CSVLogger
+except ImportError as exc:
+    raise ImportError(
+        "Missing dependency: lightning. "
+        "Install in your conda env (ml/ml2), e.g. `pip install lightning==2.6.1`."
+    ) from exc
 
-# --------------------------------------------------------------------------------------
-# Dynamic module loading (filenames start with digits)
-# --------------------------------------------------------------------------------------
+try:
+    from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
+    from pytorch_forecasting.data import GroupNormalizer
+    from pytorch_forecasting.metrics import QuantileLoss
+except ImportError as exc:
+    raise ImportError(
+        "Missing dependency: pytorch-forecasting. "
+        "Install in your conda env, e.g. `pip install pytorch-forecasting==1.7.0`."
+    ) from exc
 
+try:
+    import optuna
+except ImportError as exc:
+    raise ImportError(
+        "Missing dependency: optuna. "
+        "Install in your conda env, e.g. `pip install optuna`."
+    ) from exc
 
-def load_module_from_path(module_path: Path, module_name: str):
-    spec = importlib.util.spec_from_file_location(module_name, str(module_path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load module spec from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    # Required for decorators like @dataclass that inspect sys.modules during class creation.
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-# Embedded source payloads for fully self-contained runtime.
-# Maintenance note: if train/tune scripts evolve, regenerate these payloads from
-# the latest `src/4_tft_train_test.py` and `src/5_tft_tune.py`.
-# After regeneration, run `python src/4_tft_hpt_static_audit.py` for static parity checks.
-EMBEDDED_TRAIN_SRC_B64_ZLIB = (
-
-    "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"
-    "y/EbEMINlPyMkgTZYJJ4M3l/DIl98r8BTQyplw=="
-)
-
-EMBEDDED_TUNE_SRC_B64_ZLIB = (
-
-    "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"
-)
+try:
+    from optuna.integration import PyTorchLightningPruningCallback
+except Exception:
+    try:
+        # Newer packaging may require the separate optuna-integration package.
+        from optuna_integration.pytorch_lightning import PyTorchLightningPruningCallback
+    except Exception as exc:
+        raise ImportError(
+            "Missing dependency for Optuna pruning callback. "
+            "Install `optuna-integration` (or compatible optuna extras)."
+        ) from exc
 
 
-def _decode_embedded_source(payload: str) -> str:
-    return zlib.decompress(base64.b64decode(payload.encode("ascii"))).decode("utf-8")
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — SHARED CONSTANTS & UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+DATE_COL = "Date"
+SYMBOL_COL = "Symbol"
+TIME_IDX_COL = "time_idx"
+TARGET_COL = "target_pct_change"
+PRICE_COL = "Adj Close"
+
+TRAIN_END = "2024-12-31"
+VAL_START = "2025-01-01"
+VAL_END = "2025-06-30"
+TEST_START = "2025-07-01"
+
+DEFAULT_WINDOWS = (7, 10, 15, 30)
+DEFAULT_PREDICTION_LENGTH = 1
+
+DEFAULT_DATA_PATH = Path("dataset/tft_ready.csv")
+DEFAULT_TRAIN_ARTIFACT_ROOT = Path("artifacts/tft")
+DEFAULT_TUNE_ARTIFACT_ROOT = Path("artifacts/tft_tune")
+
+# Drop raw OHLCV from model features (keep Adj Close in the original dataframe
+# for price-space evaluation).
+RAW_FEATURE_DROP = {
+    "Open", "High", "Low", "Close", "Adj Close", "Volume", "symbol_base", DATE_COL
+}
+
+# Calendar known covariates
+CALENDAR_KNOWN_CATEGORICALS = ["dow", "dom", "month", "is_month_start", "is_month_end"]
+CALENDAR_KNOWN_REALS = [TIME_IDX_COL]
+
+# Per-window base batch sizes (effective batch doubles with accumulate_grad_batches=2).
+WINDOW_BATCH_SIZE = {7: 128, 10: 128, 15: 96, 30: 64}
+
+FINAL_METRIC_COLUMNS = [
+    "window",
+    "mape",
+    "mae",
+    "rmse",
+    "mse",
+    "directional_accuracy",
+    "precision_up",
+    "recall_up",
+    "f1_up",
+]
 
 
-def _materialize_embedded_runtime_dir() -> Path:
-    runtime_dir = Path(tempfile.mkdtemp(prefix="tft_unified_embedded_"))
+# ── Logging / warnings / seeding ─────────────────────────────────────────────
 
-    train_path = runtime_dir / "4_tft_train_test.py"
-    tune_path = runtime_dir / "5_tft_tune.py"
-
-    train_path.write_text(_decode_embedded_source(EMBEDDED_TRAIN_SRC_B64_ZLIB), encoding="utf-8")
-    tune_path.write_text(_decode_embedded_source(EMBEDDED_TUNE_SRC_B64_ZLIB), encoding="utf-8")
-
-    def _cleanup() -> None:
-        shutil.rmtree(runtime_dir, ignore_errors=True)
-
-    atexit.register(_cleanup)
-    return runtime_dir
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    # Suppress noisy Lightning info lines (hardware availability, LOCAL_RANK, …)
+    for noisy_logger in ("lightning", "lightning.pytorch", "pytorch_lightning"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 
-_RUNTIME_DIR = _materialize_embedded_runtime_dir()
-TRAIN_SCRIPT_PATH = _RUNTIME_DIR / "4_tft_train_test.py"
-TUNE_SCRIPT_PATH = _RUNTIME_DIR / "5_tft_tune.py"
-
-TRAIN = load_module_from_path(TRAIN_SCRIPT_PATH, "tft_train_test_unified_base")
-_TUNE = None
-
-
-def get_tune_module():
-    global _TUNE
-    if _TUNE is None:
-        _TUNE = load_module_from_path(TUNE_SCRIPT_PATH, "tft_tune_unified_base")
-    return _TUNE
-
-
-# Reused constants for parity with existing scripts.
-DEFAULT_WINDOWS = TRAIN.DEFAULT_WINDOWS
-DEFAULT_PREDICTION_LENGTH = TRAIN.DEFAULT_PREDICTION_LENGTH
-DEFAULT_DATA_PATH = TRAIN.DEFAULT_DATA_PATH
-
-
-# --------------------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------------------
+def configure_warnings() -> None:
+    # Non-actionable Lightning / PyTorch-Forecasting warnings that add terminal noise.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Attribute 'loss' is an instance of `nn.Module` and is already saved during checkpointing.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Attribute 'logging_metrics' is an instance of `nn.Module` and is already saved during checkpointing.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Checkpoint directory .* exists and is not empty\.",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Starting from v1\.9\.0, `tensorboardX` has been removed as a dependency of the `lightning\.pytorch` package.*",
+    )
 
 
-@dataclass
-class UnifiedConfig:
-    data_path: Path
-    train_artifact_root: Path
-    tune_artifact_root: Path
-    windows: List[int]
-    prediction_length: int
-    seed: int
-    allow_cpu_fallback: bool
-
-    # Train knobs (from 4_tft_train_test.py)
-    train_max_epochs: int
-    train_patience: int
-    train_num_workers: int
-    train_learning_rate: float
-    train_hidden_size: int
-    train_hidden_continuous_size: int
-    train_attention_head_size: int
-    train_lstm_layers: int
-    train_dropout: float
-    train_gradient_clip_val: float
-    train_limit_val_batches: int
-    train_accumulate_grad_batches: int
-
-    # Tune knobs (from 5_tft_tune.py)
-    tune_n_trials: int
-    tune_max_total_trials: Optional[int]
-    tune_max_epochs: int
-    tune_patience: int
-    tune_num_workers: int
-    tune_study_prefix: str
-    tune_timeout_seconds: Optional[int]
-    tune_accumulate_grad_batches: int
-    tune_limit_val_batches: int
-    tune_eval_test_metrics: bool
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    pl.seed_everything(seed, workers=True)
 
 
-# --------------------------------------------------------------------------------------
-# Menu / interaction
-# --------------------------------------------------------------------------------------
+# ── Path / JSON helpers ───────────────────────────────────────────────────────
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
-def choose_mode_menu() -> str:
+def parse_windows(text: str) -> List[int]:
+    values = []
+    for token in text.split(","):
+        token = token.strip()
+        if token:
+            values.append(int(token))
+    return values
+
+
+def choose_windows_menu(default_windows: Sequence[int]) -> List[int]:
     """
-    Mode menu:
-      0 -> tune + train + test
-      1 -> train + test
-      2 -> inference only
-      3 -> exit
-
-    Empty input defaults to option 2.
+    Interactive selector for encoder windows.
+    Menu mapping:
+      0 -> [7]
+      1 -> [10]
+      2 -> [15]
+      3 -> [30]
+      4 -> [7, 10, 15, 30]
+      5 -> Exit
+    Empty input defaults to option 4 (all windows).
     """
+    menu = {
+        "0": [7],
+        "1": [10],
+        "2": [15],
+        "3": [30],
+        "4": list(DEFAULT_WINDOWS),
+    }
     lines = [
         "",
-        "Select TFT operation mode:",
-        "  [0] hyperparameter Tunning, Train and test on all the windows,",
-        "  [1] Only trainig and testing",
-        "  [2] only Inferenece",
-        "  [3] Exit",
+        "Select TFT encoder window(s):",
+        "  [0] 7 days",
+        "  [1] 10 days",
+        "  [2] 15 days",
+        "  [3] 30 days",
+        "  [4] All windows (7,10,15,30)",
+        "  [5] Exit",
     ]
     print("\n".join(lines))
 
     while True:
         try:
-            choice = input("Enter choice (0-3) [default: 2]: ").strip()
+            choice = input("Enter choice (0-5) [default: 4]: ").strip()
         except EOFError:
-            logging.info("No interactive input detected. Using default mode: [2] inference.")
-            return "2"
+            logging.info(
+                "No interactive input detected. Using default windows: %s",
+                list(default_windows),
+            )
+            return list(default_windows)
 
         if choice == "":
-            choice = "2"
+            choice = "4"
 
-        if choice in {"0", "1", "2", "3"}:
-            return choice
+        if choice in menu:
+            selected = menu[choice]
+            logging.info("Window menu selection -> %s", selected)
+            return selected
 
-        print("Invalid choice. Please select one of: 0, 1, 2, 3.")
+        if choice == "5":
+            logging.info("Window menu selection -> exit")
+            raise SystemExit(0)
 
-
-def confirm_mode(choice: str) -> bool:
-    if choice == "3":
-        return True
-
-    descriptions = {
-        "0": "Hyperparameter Tuning + Train + Test",
-        "1": "Training + Testing",
-        "2": "Inference only",
-    }
-    label = descriptions.get(choice, "selected mode")
-    prompt = (
-        f"Confirm {label}? This may update saved artifacts "
-        f"(resume checkpoints for mode 0/1, outputs for mode 2) [y/N]: "
-    )
-
-    try:
-        text = input(prompt).strip().lower()
-    except EOFError:
-        logging.warning("Confirmation input not available. Cancelling.")
-        return False
-
-    return text in {"y", "yes"}
+        print("Invalid choice. Please select one of: 0, 1, 2, 3, 4, 5.")
 
 
-# --------------------------------------------------------------------------------------
-# Hyperparameter loading
-# --------------------------------------------------------------------------------------
+def now_utc_iso() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _first_present(dct: Dict, keys: Sequence[str]):
-    for key in keys:
-        if key in dct and dct[key] is not None:
-            return dct[key]
-    return None
+def read_json(path: Path) -> Dict:
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def _as_float(value) -> Optional[float]:
-    if value is None:
+def write_json(path: Path, payload: Dict) -> None:
+    ensure_dir(path.parent)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    tmp.replace(path)
+
+
+def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    if not checkpoint_dir.exists():
         return None
-    try:
-        return float(value)
-    except Exception:
+    candidates = [p for p in checkpoint_dir.glob("*.ckpt") if p.is_file()]
+    if not candidates:
         return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
 
 
-def _as_int(value) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except Exception:
-        try:
-            return int(float(value))
-        except Exception:
-            return None
+# ── Array helpers ─────────────────────────────────────────────────────────────
+
+def to_numpy(x) -> np.ndarray:
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    if isinstance(x, np.ndarray):
+        return x
+    return np.asarray(x)
 
 
-def adaptive_lstm_layers_for_window(window: int) -> int:
-    """
-    Mirror the architecture rule used during Optuna trials in src/5_tft_tune.py.
-    """
-    return 1 if int(window) <= 10 else 2
+def safe_div(a: np.ndarray, b: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    return a / np.where(np.abs(b) < eps, eps, b)
 
 
-def pick_loader_workers(requested_workers: int) -> Tuple[int, int]:
-    """
-    Match src/5_tft_tune.py behavior:
-    - train workers: requested value (or auto=4 when negative)
-    - eval workers: half of train workers
-    """
-    if requested_workers < 0:
-        train_workers = 4
-    else:
-        train_workers = max(0, int(requested_workers))
-    eval_workers = max(0, train_workers // 2)
-    return train_workers, eval_workers
+def compute_regression_metrics(
+    y_true: np.ndarray, y_pred: np.ndarray
+) -> Dict[str, float]:
+    err = y_pred - y_true
+    mse_val = float(np.mean(np.square(err)))
+    mae_val = float(np.mean(np.abs(err)))
+    rmse_val = float(np.sqrt(mse_val))
+    return {"mse": mse_val, "mae": mae_val, "rmse": rmse_val}
 
 
-def load_tuned_hparams_for_window(tune_artifact_root: Path, window: int) -> Optional[Tuple[Dict[str, float], Path]]:
-    """
-    Reads artifacts/tft_tune/window_{w}/best_trial.json and supports both old/new schemas.
+def compute_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    err = y_pred - y_true
+    return float(np.mean(np.abs(safe_div(err, y_true))) * 100.0)
 
-    Contract:
-    - learning_rate, dropout, gradient_clip_val from best_params
-    - hidden_size, hidden_continuous_size, attention_head_size:
-      prefer best_user_attrs.effective_*, fallback to best_params keys
-      with or without _v2 suffix.
-    """
-    best_path = tune_artifact_root / f"window_{window}" / "best_trial.json"
-    if not best_path.exists():
-        return None
 
-    payload = TRAIN.read_json(best_path)
-    best_params = payload.get("best_params", {}) if isinstance(payload, dict) else {}
-    best_user_attrs = payload.get("best_user_attrs", {}) if isinstance(payload, dict) else {}
-
-    if not isinstance(best_params, dict):
-        best_params = {}
-    if not isinstance(best_user_attrs, dict):
-        best_user_attrs = {}
-
-    tuned = {
-        "learning_rate": _as_float(_first_present(best_params, ["learning_rate"])),
-        "dropout": _as_float(_first_present(best_params, ["dropout"])),
-        "gradient_clip_val": _as_float(_first_present(best_params, ["gradient_clip_val"])),
-        "hidden_size": _as_int(
-            _first_present(best_user_attrs, ["effective_hidden_size"])
-            or _first_present(best_params, ["hidden_size", "hidden_size_v2"])
-        ),
-        "hidden_continuous_size": _as_int(
-            _first_present(best_user_attrs, ["effective_hidden_continuous_size"])
-            or _first_present(best_params, ["hidden_continuous_size", "hidden_continuous_size_v2"])
-        ),
-        "attention_head_size": _as_int(
-            _first_present(best_user_attrs, ["effective_attention_head_size"])
-            or _first_present(best_params, ["attention_head_size", "attention_head_size_v2"])
-        ),
-        "lstm_layers": _as_int(
-            _first_present(best_user_attrs, ["effective_lstm_layers"])
-            or _first_present(best_params, ["lstm_layers"])
-            or adaptive_lstm_layers_for_window(window)
-        ),
+def compute_direction_metrics(
+    y_true: np.ndarray, y_pred: np.ndarray
+) -> Dict[str, float]:
+    true_up = (y_true > 0.0).astype(np.int32)
+    pred_up = (y_pred > 0.0).astype(np.int32)
+    directional_accuracy = float(np.mean(true_up == pred_up))
+    precision_up = float(precision_score(true_up, pred_up, zero_division=0))
+    recall_up = float(recall_score(true_up, pred_up, zero_division=0))
+    f1_up = float(f1_score(true_up, pred_up, zero_division=0))
+    return {
+        "directional_accuracy": directional_accuracy,
+        "precision_up": precision_up,
+        "recall_up": recall_up,
+        "f1_up": f1_up,
     }
 
-    return tuned, best_path
 
+# ── Data preparation ──────────────────────────────────────────────────────────
 
-def resolve_effective_hparams(
-    cfg: UnifiedConfig,
-    window: int,
-    require_tuned: bool,
-) -> Tuple[Dict[str, float], str, Optional[Path]]:
-    defaults = {
-        "learning_rate": float(cfg.train_learning_rate),
-        "dropout": float(cfg.train_dropout),
-        "gradient_clip_val": float(cfg.train_gradient_clip_val),
-        "hidden_size": int(cfg.train_hidden_size),
-        "hidden_continuous_size": int(cfg.train_hidden_continuous_size),
-        "attention_head_size": int(cfg.train_attention_head_size),
-        "lstm_layers": int(cfg.train_lstm_layers),
-    }
+def load_and_prepare_dataframe(data_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(data_path)
+    required = {DATE_COL, SYMBOL_COL, TIME_IDX_COL, TARGET_COL, PRICE_COL}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Missing required columns in {data_path}: {missing}")
 
-    tuned_payload = load_tuned_hparams_for_window(cfg.tune_artifact_root, window)
-    if tuned_payload is None:
-        if require_tuned:
-            raise FileNotFoundError(
-                f"window={window}: expected tuned hyperparameters at "
-                f"{cfg.tune_artifact_root / f'window_{window}' / 'best_trial.json'}"
-            )
-        return defaults, "default", None
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+    if df[DATE_COL].isna().any():
+        raise ValueError("Invalid Date values found in dataset.")
 
-    tuned, path = tuned_payload
-    effective = defaults.copy()
-    for key in effective:
-        if tuned.get(key) is not None:
-            effective[key] = tuned[key]
-
-    return effective, "tuned", path
-
-
-def backfill_tune_lstm_metadata(tune_artifact_root: Path, window: int) -> None:
-    """
-    Ensure best_trial.json carries lstm layer info so future train-only runs can read
-    architecture directly from persisted tuning metadata.
-    """
-    best_path = tune_artifact_root / f"window_{window}" / "best_trial.json"
-    if not best_path.exists():
-        return
-
-    payload = TRAIN.read_json(best_path)
-    if not isinstance(payload, dict):
-        return
-
-    best_params = payload.get("best_params")
-    if not isinstance(best_params, dict):
-        best_params = {}
-    best_user_attrs = payload.get("best_user_attrs")
-    if not isinstance(best_user_attrs, dict):
-        best_user_attrs = {}
-
-    lstm_layers = adaptive_lstm_layers_for_window(window)
-    changed = False
-    if best_params.get("lstm_layers") != int(lstm_layers):
-        best_params["lstm_layers"] = int(lstm_layers)
-        changed = True
-    if best_user_attrs.get("effective_lstm_layers") != int(lstm_layers):
-        best_user_attrs["effective_lstm_layers"] = int(lstm_layers)
-        changed = True
-
-    if changed:
-        payload["best_params"] = best_params
-        payload["best_user_attrs"] = best_user_attrs
-        TRAIN.write_json(best_path, payload)
-
-
-# --------------------------------------------------------------------------------------
-# Runtime setup
-# --------------------------------------------------------------------------------------
-
-
-def configure_runtime(seed: int) -> None:
-    TRAIN.configure_logging()
-    TRAIN.configure_warnings()
-
-    # Optimizations used in tune script.
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-    os.environ.setdefault("OMP_NUM_THREADS", "4")
-    os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "100000")
-
-    try:
-        # Reduce file descriptor pressure from DataLoader shared-memory handles.
-        torch.multiprocessing.set_sharing_strategy("file_system")
-    except Exception:
-        pass
-
-    try:
-        torch.set_num_threads(4)
-        torch.set_num_interop_threads(1)
-    except Exception:
-        pass
-
-    torch.set_float32_matmul_precision("medium")
-    TRAIN.set_seed(seed)
-
-
-# --------------------------------------------------------------------------------------
-# Device checks
-# --------------------------------------------------------------------------------------
-
-
-def get_cuda_runtime_info() -> Dict[str, object]:
-    info: Dict[str, object] = {
-        "torch_version": getattr(torch, "__version__", "unknown"),
-        "torch_cuda_build": getattr(torch.version, "cuda", None),
-        "cuda_available": bool(torch.cuda.is_available()),
-        "cuda_device_count": int(torch.cuda.device_count()),
-        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
-    }
-    if info["cuda_available"]:
-        try:
-            info["cuda_device_name"] = torch.cuda.get_device_name(0)
-        except Exception:
-            info["cuda_device_name"] = "<unknown>"
-    else:
-        info["cuda_device_name"] = None
-    return info
-
-
-def ensure_cuda_for_training_or_raise(allow_cpu_fallback: bool, mode_label: str) -> bool:
-    """
-    Returns True when CUDA is available (GPU training), otherwise either:
-    - raises RuntimeError (default), or
-    - returns False if --allow-cpu-fallback is enabled.
-    """
-    info = get_cuda_runtime_info()
-    if info["cuda_available"]:
-        logging.info(
-            "CUDA ready for %s | torch=%s cuda_build=%s device_count=%s device_0=%s visible_devices=%s",
-            mode_label,
-            info["torch_version"],
-            info["torch_cuda_build"],
-            info["cuda_device_count"],
-            info["cuda_device_name"],
-            info["cuda_visible_devices"],
+    if df[[SYMBOL_COL, TIME_IDX_COL, TARGET_COL]].isna().any().any():
+        raise ValueError(
+            "Found NaNs in one of required columns: Symbol, time_idx, target_pct_change."
         )
-        return True
 
-    msg = (
-        f"GPU training was requested for {mode_label}, but torch.cuda.is_available() is False. "
-        f"Detected: torch={info['torch_version']} cuda_build={info['torch_cuda_build']} "
-        f"device_count={info['cuda_device_count']} CUDA_VISIBLE_DEVICES={info['cuda_visible_devices']}. "
-        "This usually means a CPU-only PyTorch build or CUDA/driver mismatch in the current env. "
-        "Install CUDA-enabled PyTorch in your `ml` conda env. "
-        "If you intentionally want CPU, rerun with --allow-cpu-fallback."
+    df[TIME_IDX_COL] = df[TIME_IDX_COL].astype(np.int64)
+    df = df.sort_values([SYMBOL_COL, DATE_COL], kind="mergesort").reset_index(drop=True)
+
+    # Add known calendar features as categoricals for TFT embeddings.
+    df["dow"] = df[DATE_COL].dt.weekday.astype(np.int16).astype(str)
+    df["dom"] = df[DATE_COL].dt.day.astype(np.int16).astype(str)
+    df["month"] = df[DATE_COL].dt.month.astype(np.int16).astype(str)
+    df["is_month_start"] = df[DATE_COL].dt.is_month_start.astype(np.int8).astype(str)
+    df["is_month_end"] = df[DATE_COL].dt.is_month_end.astype(np.int8).astype(str)
+
+    dup_count = int(df.duplicated([SYMBOL_COL, DATE_COL]).sum())
+    if dup_count > 0:
+        raise ValueError(f"Found duplicated (Symbol, Date) rows: {dup_count}")
+
+    return df
+
+
+def get_split_masks(
+    df: pd.DataFrame,
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    train_end = pd.Timestamp(TRAIN_END)
+    val_start = pd.Timestamp(VAL_START)
+    val_end = pd.Timestamp(VAL_END)
+    test_start = pd.Timestamp(TEST_START)
+
+    train_mask = df[DATE_COL] <= train_end
+    val_mask = (df[DATE_COL] >= val_start) & (df[DATE_COL] <= val_end)
+    test_mask = df[DATE_COL] >= test_start
+
+    return train_mask, val_mask, test_mask
+
+
+def choose_model_features(
+    df: pd.DataFrame,
+) -> Tuple[List[str], List[str], List[str]]:
+    known_categoricals = [c for c in CALENDAR_KNOWN_CATEGORICALS if c in df.columns]
+    # Known reals are deterministic numeric features available in the future.
+    known_reals = [c for c in CALENDAR_KNOWN_REALS if c in df.columns]
+
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    excluded = set(known_reals + [TARGET_COL, TIME_IDX_COL])
+    unknown_covariates = [
+        c for c in numeric_cols if c not in excluded and c not in RAW_FEATURE_DROP
+    ]
+
+    # Target must be included among unknown reals for autoregressive decoding.
+    unknown_reals = [TARGET_COL] + unknown_covariates
+
+    # Keep order stable and unique.
+    seen: set = set()
+    unknown_reals = [c for c in unknown_reals if not (c in seen or seen.add(c))]
+    return known_categoricals, known_reals, unknown_reals
+
+
+def filter_eligible_symbols(
+    df: pd.DataFrame,
+    encoder_length: int,
+    prediction_length: int,
+) -> List[str]:
+    train_mask, val_mask, test_mask = get_split_masks(df)
+
+    min_train_rows = encoder_length + prediction_length + 1
+
+    train_counts = df.loc[train_mask].groupby(SYMBOL_COL).size()
+    val_counts = df.loc[val_mask].groupby(SYMBOL_COL).size()
+    test_counts = df.loc[test_mask].groupby(SYMBOL_COL).size()
+
+    eligible = []
+    for symbol in sorted(df[SYMBOL_COL].unique()):
+        if int(train_counts.get(symbol, 0)) < min_train_rows:
+            continue
+        if int(val_counts.get(symbol, 0)) < prediction_length:
+            continue
+        if int(test_counts.get(symbol, 0)) < prediction_length:
+            continue
+        eligible.append(symbol)
+
+    return eligible
+
+
+def build_datasets_for_window(
+    df: pd.DataFrame,
+    encoder_length: int,
+    prediction_length: int,
+) -> Tuple[TimeSeriesDataSet, TimeSeriesDataSet, TimeSeriesDataSet, pd.DataFrame]:
+    eligible_symbols = filter_eligible_symbols(
+        df=df,
+        encoder_length=encoder_length,
+        prediction_length=prediction_length,
     )
-    if allow_cpu_fallback:
-        logging.warning(msg)
-        logging.warning("Continuing with CPU because --allow-cpu-fallback is enabled.")
-        return False
-    raise RuntimeError(msg)
+    if not eligible_symbols:
+        raise ValueError(
+            f"No eligible symbols for window={encoder_length}. "
+            "Check split dates and minimum history."
+        )
 
+    work_df = df[df[SYMBOL_COL].isin(eligible_symbols)].copy()
+    known_categoricals, known_reals, unknown_reals = choose_model_features(work_df)
 
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
+    train_mask, _, _ = get_split_masks(work_df)
+    train_df = work_df.loc[train_mask].copy()
 
-
-def remove_existing_train_window_artifacts(train_artifact_root: Path, windows: Sequence[int]) -> None:
-    """Force overwrite behavior by clearing window directories before training."""
-    for window in windows:
-        window_dir = train_artifact_root / f"window_{window}"
-        if window_dir.exists():
-            shutil.rmtree(window_dir)
-
-
-def build_test_loader_for_window(cfg: UnifiedConfig, base_df: pd.DataFrame, window: int):
-    _, _, test_ds, work_df = TRAIN.build_datasets_for_window(
-        df=base_df,
-        encoder_length=window,
-        prediction_length=cfg.prediction_length,
+    val_start_idx = int(
+        work_df.loc[work_df[DATE_COL] >= pd.Timestamp(VAL_START), TIME_IDX_COL].min()
     )
-    batch_size = TRAIN.WINDOW_BATCH_SIZE.get(window, 64)
-    test_loader = test_ds.to_dataloader(
-        train=False,
-        batch_size=batch_size,
-        num_workers=cfg.train_num_workers,
-        persistent_workers=cfg.train_num_workers > 0,
-        pin_memory=torch.cuda.is_available(),
+    test_start_idx = int(
+        work_df.loc[work_df[DATE_COL] >= pd.Timestamp(TEST_START), TIME_IDX_COL].min()
     )
-    return test_loader, work_df
+    val_df = work_df.loc[work_df[DATE_COL] <= pd.Timestamp(VAL_END)].copy()
+    test_df = work_df.copy()
 
+    # Drop raw OHLCV columns from model covariates (but keep DATE_COL in work_df).
+    drop_cols = [
+        c for c in RAW_FEATURE_DROP if c in train_df.columns and c != DATE_COL
+    ]
+    train_model = train_df.drop(columns=drop_cols, errors="ignore")
+    val_model = val_df.drop(columns=drop_cols, errors="ignore")
+    test_model = test_df.drop(columns=drop_cols, errors="ignore")
 
-def resolve_checkpoint_for_inference(window_dir: Path) -> Optional[str]:
-    state_path = window_dir / "state.json"
-    checkpoints_dir = window_dir / "checkpoints"
-
-    state = TRAIN.read_json(state_path)
-    for key in ("best_ckpt", "last_ckpt"):
-        ckpt = state.get(key)
-        if ckpt and Path(ckpt).exists():
-            return str(Path(ckpt))
-
-    latest = TRAIN.find_latest_checkpoint(checkpoints_dir)
-    if latest is not None:
-        return str(latest)
-    return None
-
-
-# --------------------------------------------------------------------------------------
-# Mode implementations
-# --------------------------------------------------------------------------------------
-
-
-def run_tuning_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
-    tune = get_tune_module()
-    TRAIN.ensure_dir(cfg.tune_artifact_root)
-
-    tune_cfg = tune.TuneConfig(
-        data_path=cfg.data_path,
-        artifact_root=cfg.tune_artifact_root,
-        windows=list(cfg.windows),
-        prediction_length=int(cfg.prediction_length),
-        n_trials=int(cfg.tune_n_trials),
-        max_total_trials=int(cfg.tune_max_total_trials) if cfg.tune_max_total_trials is not None else None,
-        max_epochs=int(cfg.tune_max_epochs),
-        patience=int(cfg.tune_patience),
-        num_workers=int(cfg.tune_num_workers),
-        seed=int(cfg.seed),
-        study_prefix=str(cfg.tune_study_prefix),
-        timeout_seconds=int(cfg.tune_timeout_seconds) if cfg.tune_timeout_seconds is not None else None,
-        accumulate_grad_batches=int(cfg.tune_accumulate_grad_batches),
-        limit_val_batches=int(cfg.tune_limit_val_batches),
-        eval_test_metrics=bool(cfg.tune_eval_test_metrics),
+    training = TimeSeriesDataSet(
+        train_model,
+        time_idx=TIME_IDX_COL,
+        target=TARGET_COL,
+        group_ids=[SYMBOL_COL],
+        min_encoder_length=encoder_length,
+        max_encoder_length=encoder_length,
+        min_prediction_length=prediction_length,
+        max_prediction_length=prediction_length,
+        static_categoricals=[SYMBOL_COL],
+        time_varying_known_categoricals=known_categoricals,
+        time_varying_known_reals=known_reals,
+        time_varying_unknown_reals=unknown_reals,
+        target_normalizer=GroupNormalizer(groups=[SYMBOL_COL], method="standard"),
+        add_relative_time_idx=False,
+        add_target_scales=True,
+        add_encoder_length=True,
+        # Some symbols have legitimate gaps in the trading timeline (listing changes,
+        # corporate actions, data holes).  Enable this to let TFT build sequences
+        # without hard-failing on non-unit time_idx jumps.
+        allow_missing_timesteps=True,
     )
 
-    summary_rows: List[Dict] = []
-    for window in cfg.windows:
-        try:
-            row = tune.tune_window(cfg=tune_cfg, base_df=base_df, window=window)
-            backfill_tune_lstm_metadata(cfg.tune_artifact_root, window)
-            summary_rows.append(row)
-        except Exception as exc:
-            logging.error("window=%s tuning failed: %s", window, exc)
-            logging.debug("Traceback:\n%s", traceback.format_exc())
-            summary_rows.append(
-                {
-                    "window": window,
-                    "study_name": f"{cfg.tune_study_prefix}{window}",
-                    "study_db": str((cfg.tune_artifact_root / f"window_{window}" / "study.db")),
-                    "n_trials_total": None,
-                    "best_val_loss": None,
-                    "best_trial_number": None,
-                    "error": str(exc),
-                }
-            )
+    validation = TimeSeriesDataSet.from_dataset(
+        training,
+        val_model,
+        min_prediction_idx=val_start_idx,
+        stop_randomization=True,
+    )
+    test = TimeSeriesDataSet.from_dataset(
+        training,
+        test_model,
+        min_prediction_idx=test_start_idx,
+        stop_randomization=True,
+    )
 
-    summary_df = pd.DataFrame(summary_rows)
-    summary_path = cfg.tune_artifact_root / "tuning_summary.csv"
-    summary_df.to_csv(summary_path, index=False)
-    logging.info("Saved tuning summary -> %s", summary_path)
+    return training, validation, test, work_df
 
 
-def run_window_training_optimized(
-    cfg: TRAIN.RunConfig,
+# ── Prediction helpers ────────────────────────────────────────────────────────
+
+def unpack_prediction_output(
+    pred_output,
+) -> Tuple[np.ndarray, pd.DataFrame]:
+    preds = None
+    index_df = None
+
+    if hasattr(pred_output, "prediction"):
+        preds = pred_output.prediction
+        index_df = getattr(pred_output, "index", None)
+    elif hasattr(pred_output, "output"):
+        preds = pred_output.output
+        index_df = getattr(pred_output, "index", None)
+    elif isinstance(pred_output, tuple):
+        for item in pred_output:
+            if isinstance(item, pd.DataFrame):
+                index_df = item
+            elif torch.is_tensor(item) or isinstance(item, np.ndarray):
+                preds = item
+            elif hasattr(item, "prediction"):
+                preds = item.prediction
+                index_df = getattr(item, "index", index_df)
+            elif hasattr(item, "output"):
+                preds = item.output
+                index_df = getattr(item, "index", index_df)
+    elif torch.is_tensor(pred_output) or isinstance(pred_output, np.ndarray):
+        preds = pred_output
+
+    if preds is None:
+        raise RuntimeError(
+            "Could not extract predictions from model.predict(...) output."
+        )
+    if index_df is None:
+        raise RuntimeError(
+            "Could not extract index dataframe from model.predict(...) output."
+        )
+
+    pred_np = to_numpy(preds)
+
+    # Quantile output fallback: choose median quantile.
+    if pred_np.ndim == 3:
+        pred_np = pred_np[:, :, pred_np.shape[-1] // 2]
+    elif pred_np.ndim == 1:
+        pred_np = pred_np[:, None]
+
+    return pred_np, index_df.copy()
+
+
+def find_symbol_col(index_df: pd.DataFrame) -> str:
+    candidates = [SYMBOL_COL, "__group_id__Symbol", "symbol", "__group_id__symbol"]
+    for c in candidates:
+        if c in index_df.columns:
+            return c
+    obj_cols = [c for c in index_df.columns if index_df[c].dtype == "object"]
+    if obj_cols:
+        return obj_cols[0]
+    raise RuntimeError(
+        f"Could not identify symbol column in prediction index columns: "
+        f"{index_df.columns.tolist()}"
+    )
+
+
+def find_time_col(index_df: pd.DataFrame) -> str:
+    candidates = [TIME_IDX_COL, "decoder_time_idx", "__time_idx__"]
+    for c in candidates:
+        if c in index_df.columns:
+            return c
+    fuzzy = [c for c in index_df.columns if "time_idx" in c]
+    if fuzzy:
+        return fuzzy[0]
+    raise RuntimeError(
+        f"Could not identify time_idx column in prediction index columns: "
+        f"{index_df.columns.tolist()}"
+    )
+
+
+def build_truth_and_price_matrices(
+    pred_returns: np.ndarray,
+    pred_index: pd.DataFrame,
+    base_df: pd.DataFrame,
+    prediction_length: int,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    if pred_returns.ndim == 1:
+        pred_returns = pred_returns[:, None]
+
+    symbol_col = find_symbol_col(pred_index)
+    time_col = find_time_col(pred_index)
+
+    symbols = pred_index[symbol_col].astype(str).to_numpy()
+    start_idx = pred_index[time_col].astype(np.int64).to_numpy()
+
+    n = pred_returns.shape[0]
+    if len(symbols) != n:
+        m = min(len(symbols), n)
+        symbols = symbols[:m]
+        start_idx = start_idx[:m]
+        pred_returns = pred_returns[:m]
+        n = m
+
+    lookup_target = base_df.set_index([SYMBOL_COL, TIME_IDX_COL])[TARGET_COL].to_dict()
+    lookup_price = base_df.set_index([SYMBOL_COL, TIME_IDX_COL])[PRICE_COL].to_dict()
+    lookup_date = (
+        base_df.drop_duplicates(TIME_IDX_COL)
+        .set_index(TIME_IDX_COL)[DATE_COL]
+        .to_dict()
+    )
+
+    true_returns = np.full((n, prediction_length), np.nan, dtype=np.float64)
+    for h in range(prediction_length):
+        ti = start_idx + h
+        vals = [
+            lookup_target.get((sym, int(t)), np.nan)
+            for sym, t in zip(symbols, ti)
+        ]
+        true_returns[:, h] = np.asarray(vals, dtype=np.float64)
+
+    # Use the encoder end price (time_idx - 1) as base for strict no-lookahead
+    # price reconstruction.
+    base_prices = np.asarray(
+        [
+            lookup_price.get((sym, int(t) - 1), np.nan)
+            for sym, t in zip(symbols, start_idx)
+        ],
+        dtype=np.float64,
+    )
+    pred_prices = base_prices[:, None] * np.cumprod(1.0 + pred_returns, axis=1)
+    true_prices = base_prices[:, None] * np.cumprod(1.0 + true_returns, axis=1)
+
+    start_dates = np.asarray(
+        [lookup_date.get(int(t), pd.NaT) for t in start_idx]
+    )
+    return symbols, start_idx, start_dates, true_returns, pred_prices, true_prices
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — TRAINING & TESTING
+# ══════════════════════════════════════════════════════════════════════════════
+
+class WindowStateCallback(Callback):
+    """Lightning callback that writes crash-safe state JSON after every epoch."""
+
+    def __init__(self, state_path: Path, checkpoint_dir: Path, window: int) -> None:
+        super().__init__()
+        self.state_path = state_path
+        self.checkpoint_dir = checkpoint_dir
+        self.window = window
+
+    def _write(
+        self, trainer: pl.Trainer, status: str, message: str = ""
+    ) -> None:
+        latest_ckpt = find_latest_checkpoint(self.checkpoint_dir)
+        payload = read_json(self.state_path)
+        payload.update(
+            {
+                "window": self.window,
+                "status": status,
+                "last_epoch_completed": int(trainer.current_epoch),
+                "global_step": int(trainer.global_step),
+                "last_ckpt": (
+                    str(latest_ckpt)
+                    if latest_ckpt
+                    else payload.get("last_ckpt", "")
+                ),
+                "message": message,
+                "updated_at": now_utc_iso(),
+            }
+        )
+        write_json(self.state_path, payload)
+
+    def on_fit_start(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        self._write(trainer, status="training")
+
+    def on_train_epoch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        self._write(trainer, status="training")
+
+    def on_exception(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        exception: BaseException,
+    ) -> None:
+        self._write(trainer, status="interrupted", message=str(exception))
+
+
+@dataclass
+class RunConfig:
+    data_path: Path
+    artifact_root: Path
+    windows: List[int]
+    prediction_length: int
+    max_epochs: int
+    patience: int
+    num_workers: int
+    seed: int
+    learning_rate: float
+    hidden_size: int
+    hidden_continuous_size: int
+    attention_head_size: int
+    lstm_layers: int
+    dropout: float
+    gradient_clip_val: float
+    force_retrain: bool
+    limit_val_batches: int
+    accumulate_grad_batches: int
+
+
+def compute_window_metrics(
+    window: int,
+    true_returns: np.ndarray,
+    pred_returns: np.ndarray,
+    true_prices: np.ndarray,
+    pred_prices: np.ndarray,
+) -> Dict[str, float]:
+    if true_returns.ndim == 1:
+        true_returns = true_returns[:, None]
+    if pred_returns.ndim == 1:
+        pred_returns = pred_returns[:, None]
+    if true_prices.ndim == 1:
+        true_prices = true_prices[:, None]
+    if pred_prices.ndim == 1:
+        pred_prices = pred_prices[:, None]
+
+    y_true_ret = true_returns.reshape(-1)
+    y_pred_ret = pred_returns.reshape(-1)
+    valid_ret = np.isfinite(y_true_ret) & np.isfinite(y_pred_ret)
+    if not np.any(valid_ret):
+        raise RuntimeError(
+            f"window={window}: no valid return samples for pooled metric computation."
+        )
+
+    y_true_ret = y_true_ret[valid_ret]
+    y_pred_ret = y_pred_ret[valid_ret]
+    reg = compute_regression_metrics(y_true_ret, y_pred_ret)
+    cls = compute_direction_metrics(y_true_ret, y_pred_ret)
+
+    y_true_price = true_prices.reshape(-1)
+    y_pred_price = pred_prices.reshape(-1)
+    valid_price = np.isfinite(y_true_price) & np.isfinite(y_pred_price)
+    if not np.any(valid_price):
+        raise RuntimeError(
+            f"window={window}: no valid price samples for MAPE computation."
+        )
+
+    mape = compute_mape(y_true_price[valid_price], y_pred_price[valid_price])
+    return {
+        "window": int(window),
+        "mse": reg["mse"],
+        "mae": reg["mae"],
+        "rmse": reg["rmse"],
+        "mape": mape,
+        "directional_accuracy": cls["directional_accuracy"],
+        "precision_up": cls["precision_up"],
+        "recall_up": cls["recall_up"],
+        "f1_up": cls["f1_up"],
+    }
+
+
+def save_prediction_audit(
+    window_dir: Path,
+    symbols: np.ndarray,
+    start_idx: np.ndarray,
+    start_dates: np.ndarray,
+    pred_returns: np.ndarray,
+    true_returns: np.ndarray,
+    pred_prices: np.ndarray,
+    true_prices: np.ndarray,
+) -> None:
+    if pred_returns.ndim == 2:
+        pred_returns = pred_returns[:, 0]
+    if true_returns.ndim == 2:
+        true_returns = true_returns[:, 0]
+    if pred_prices.ndim == 2:
+        pred_prices = pred_prices[:, 0]
+    if true_prices.ndim == 2:
+        true_prices = true_prices[:, 0]
+
+    pred_df = pd.DataFrame(
+        {
+            "Symbol": symbols,
+            "decoder_start_time_idx": start_idx,
+            "decoder_start_date": start_dates,
+            "pred_return": pred_returns,
+            "true_return": true_returns,
+            "pred_price": pred_prices,
+            "true_price": true_prices,
+        }
+    )
+    pred_df.to_csv(window_dir / "test_predictions.csv", index=False)
+
+
+def evaluate_window_and_write_outputs(
+    window: int,
+    prediction_length: int,
+    work_df: pd.DataFrame,
+    test_loader,
+    best_ckpt: str,
+    window_dir: Path,
+    metrics_path: Path,
+    metrics_rows: List[Dict],
+    state_path: Path,
+) -> None:
+    logging.info("window=%s test prediction start", window)
+    best_model = TemporalFusionTransformer.load_from_checkpoint(best_ckpt)
+    pred_output = best_model.predict(
+        test_loader,
+        mode="prediction",
+        return_index=True,
+        trainer_kwargs={"logger": False, "enable_checkpointing": False},
+    )
+    pred_returns, pred_index = unpack_prediction_output(pred_output)
+    if pred_returns.shape[1] < prediction_length:
+        raise RuntimeError(
+            f"window={window}: predicted horizon {pred_returns.shape[1]} "
+            f"< expected {prediction_length}"
+        )
+    pred_returns = pred_returns[:, :prediction_length].astype(np.float64)
+
+    symbols, start_idx, start_dates, true_returns, pred_prices, true_prices = (
+        build_truth_and_price_matrices(
+            pred_returns=pred_returns,
+            pred_index=pred_index,
+            base_df=work_df[
+                [SYMBOL_COL, TIME_IDX_COL, TARGET_COL, PRICE_COL, DATE_COL]
+            ].copy(),
+            prediction_length=prediction_length,
+        )
+    )
+
+    window_metric = compute_window_metrics(
+        window=window,
+        true_returns=true_returns,
+        pred_returns=pred_returns,
+        true_prices=true_prices,
+        pred_prices=pred_prices,
+    )
+    metrics_df = pd.DataFrame([window_metric], columns=FINAL_METRIC_COLUMNS)
+    metrics_df.to_csv(metrics_path, index=False)
+    metrics_rows.extend(metrics_df.to_dict(orient="records"))
+
+    save_prediction_audit(
+        window_dir=window_dir,
+        symbols=symbols,
+        start_idx=start_idx,
+        start_dates=start_dates,
+        pred_returns=pred_returns,
+        true_returns=true_returns,
+        pred_prices=pred_prices,
+        true_prices=true_prices,
+    )
+
+    write_json(
+        state_path,
+        {
+            "window": window,
+            "status": "completed",
+            "updated_at": now_utc_iso(),
+            "completed_at": now_utc_iso(),
+            "best_ckpt": best_ckpt,
+            "metrics_path": str(metrics_path),
+            "prediction_audit_path": str(window_dir / "test_predictions.csv"),
+        },
+    )
+    logging.info(
+        "window=%s completed (metrics rows=%s).", window, len(metrics_df)
+    )
+
+
+def run_window_training(
+    cfg: RunConfig,
     base_df: pd.DataFrame,
     window: int,
     metrics_rows: List[Dict],
-    use_gpu: bool,
 ) -> None:
-    """
-    Same training/eval flow as TRAIN.run_window_training with train/eval dataloader
-    worker tuning borrowed from src/5_tft_tune.py.
-    """
     log = logging.getLogger(__name__)
 
     window_dir = cfg.artifact_root / f"window_{window}"
@@ -836,35 +920,55 @@ def run_window_training_optimized(
     state_path = window_dir / "state.json"
     metrics_path = window_dir / "metrics.csv"
 
-    TRAIN.ensure_dir(window_dir)
-    TRAIN.ensure_dir(checkpoints_dir)
-    TRAIN.ensure_dir(logs_dir)
+    ensure_dir(window_dir)
+    ensure_dir(checkpoints_dir)
+    ensure_dir(logs_dir)
 
-    state = TRAIN.read_json(state_path)
+    state = read_json(state_path)
     metrics_only_recompute = False
-    if state.get("status") == "completed" and metrics_path.exists() and not cfg.force_retrain:
+    if (
+        state.get("status") == "completed"
+        and metrics_path.exists()
+        and not cfg.force_retrain
+    ):
         existing = pd.read_csv(metrics_path)
-        exact_schema = list(existing.columns) == TRAIN.FINAL_METRIC_COLUMNS
+        exact_schema = list(existing.columns) == FINAL_METRIC_COLUMNS
         expected_rows = len(existing) == 1
-        no_missing_values = exact_schema and expected_rows and not existing[TRAIN.FINAL_METRIC_COLUMNS].isna().any().any()
+        no_missing_values = (
+            exact_schema
+            and expected_rows
+            and not existing[FINAL_METRIC_COLUMNS].isna().any().any()
+        )
         if no_missing_values:
-            log.info("window=%s already completed with up-to-date metrics, skipping.", window)
-            metrics_rows.extend(existing[TRAIN.FINAL_METRIC_COLUMNS].to_dict(orient="records"))
+            log.info(
+                "window=%s already completed with up-to-date metrics, skipping.",
+                window,
+            )
+            metrics_rows.extend(
+                existing[FINAL_METRIC_COLUMNS].to_dict(orient="records")
+            )
             return
         else:
             log.warning(
-                "window=%s existing metrics file is outdated (schema_ok=%s rows=%s has_nan=%s). Recomputing this window.",
+                "window=%s existing metrics file is outdated "
+                "(schema_ok=%s rows=%s has_nan=%s). Recomputing this window.",
                 window,
                 exact_schema,
                 len(existing),
-                bool(existing[TRAIN.FINAL_METRIC_COLUMNS].isna().any().any()) if exact_schema and expected_rows else True,
+                bool(existing[FINAL_METRIC_COLUMNS].isna().any().any())
+                if exact_schema and expected_rows
+                else True,
             )
             metrics_only_recompute = True
     elif state.get("status") == "completed" and not cfg.force_retrain:
-        log.warning("window=%s marked completed but metrics file missing. Recomputing this window.", window)
+        log.warning(
+            "window=%s marked completed but metrics file missing. "
+            "Recomputing this window.",
+            window,
+        )
         metrics_only_recompute = True
 
-    training_ds, val_ds, test_ds, work_df = TRAIN.build_datasets_for_window(
+    training_ds, val_ds, test_ds, work_df = build_datasets_for_window(
         df=base_df,
         encoder_length=window,
         prediction_length=cfg.prediction_length,
@@ -872,41 +976,25 @@ def run_window_training_optimized(
     log.info(
         "window=%s eligible_symbols=%s train_rows=%s val_rows=%s test_rows=%s",
         window,
-        work_df[TRAIN.SYMBOL_COL].nunique(),
-        int((work_df[TRAIN.DATE_COL] <= pd.Timestamp(TRAIN.TRAIN_END)).sum()),
+        work_df[SYMBOL_COL].nunique(),
+        int((work_df[DATE_COL] <= pd.Timestamp(TRAIN_END)).sum()),
         int(
             (
-                (work_df[TRAIN.DATE_COL] >= pd.Timestamp(TRAIN.VAL_START))
-                & (work_df[TRAIN.DATE_COL] <= pd.Timestamp(TRAIN.VAL_END))
+                (work_df[DATE_COL] >= pd.Timestamp(VAL_START))
+                & (work_df[DATE_COL] <= pd.Timestamp(VAL_END))
             ).sum()
         ),
-        int((work_df[TRAIN.DATE_COL] >= pd.Timestamp(TRAIN.TEST_START)).sum()),
+        int((work_df[DATE_COL] >= pd.Timestamp(TEST_START)).sum()),
     )
 
-    batch_size = TRAIN.WINDOW_BATCH_SIZE.get(window, 64)
-    train_workers, eval_workers = pick_loader_workers(int(cfg.num_workers))
-    train_loader_kwargs = {
-        "train": True,
-        "batch_size": batch_size,
-        "num_workers": train_workers,
-        "persistent_workers": train_workers > 0,
-        "pin_memory": use_gpu,
-    }
-    eval_loader_kwargs = {
-        "train": False,
-        "batch_size": batch_size,
-        "num_workers": eval_workers,
-        "persistent_workers": eval_workers > 0,
-        "pin_memory": use_gpu,
-    }
-    if train_workers > 0:
-        train_loader_kwargs["prefetch_factor"] = 2
-        train_loader_kwargs["multiprocessing_context"] = "fork"
-    if eval_workers > 0:
-        eval_loader_kwargs["prefetch_factor"] = 2
-        eval_loader_kwargs["multiprocessing_context"] = "fork"
-
-    test_loader = test_ds.to_dataloader(**eval_loader_kwargs)
+    batch_size = WINDOW_BATCH_SIZE.get(window, 64)
+    test_loader = test_ds.to_dataloader(
+        train=False,
+        batch_size=batch_size,
+        num_workers=cfg.num_workers,
+        persistent_workers=cfg.num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
+    )
 
     if metrics_only_recompute and not cfg.force_retrain:
         eval_ckpt = None
@@ -916,13 +1004,17 @@ def run_window_training_optimized(
                 eval_ckpt = str(Path(ck))
                 break
         if eval_ckpt is None:
-            latest = TRAIN.find_latest_checkpoint(checkpoints_dir)
+            latest = find_latest_checkpoint(checkpoints_dir)
             if latest is not None:
                 eval_ckpt = str(latest)
 
         if eval_ckpt is not None:
-            log.info("window=%s metrics-only recompute using checkpoint: %s", window, eval_ckpt)
-            TRAIN.evaluate_window_and_write_outputs(
+            log.info(
+                "window=%s metrics-only recompute using checkpoint: %s",
+                window,
+                eval_ckpt,
+            )
+            evaluate_window_and_write_outputs(
                 window=window,
                 prediction_length=cfg.prediction_length,
                 work_df=work_df,
@@ -936,21 +1028,34 @@ def run_window_training_optimized(
             return
 
         log.warning(
-            "window=%s requested metrics-only recompute but no checkpoint found. Falling back to training.",
+            "window=%s requested metrics-only recompute but no checkpoint found. "
+            "Falling back to training.",
             window,
         )
 
-    train_loader = training_ds.to_dataloader(**train_loader_kwargs)
-    val_loader = val_ds.to_dataloader(**eval_loader_kwargs)
+    train_loader = training_ds.to_dataloader(
+        train=True,
+        batch_size=batch_size,
+        num_workers=cfg.num_workers,
+        persistent_workers=cfg.num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
+    )
+    val_loader = val_ds.to_dataloader(
+        train=False,
+        batch_size=batch_size,
+        num_workers=cfg.num_workers,
+        persistent_workers=cfg.num_workers > 0,
+        pin_memory=torch.cuda.is_available(),
+    )
 
-    early_stop = TRAIN.EarlyStopping(
+    early_stop = EarlyStopping(
         monitor="val_loss",
         mode="min",
         patience=cfg.patience,
         min_delta=1e-4,
         verbose=False,
     )
-    best_ckpt_cb = TRAIN.ModelCheckpoint(
+    best_ckpt_cb = ModelCheckpoint(
         dirpath=str(checkpoints_dir),
         filename="best-epoch{epoch:03d}-valloss{val_loss:.6f}",
         monitor="val_loss",
@@ -960,7 +1065,7 @@ def run_window_training_optimized(
         every_n_epochs=1,
         auto_insert_metric_name=False,
     )
-    step_ckpt_cb = TRAIN.ModelCheckpoint(
+    step_ckpt_cb = ModelCheckpoint(
         dirpath=str(checkpoints_dir),
         filename="step-{step:09d}",
         monitor=None,
@@ -969,15 +1074,17 @@ def run_window_training_optimized(
         save_on_train_epoch_end=False,
         auto_insert_metric_name=False,
     )
-    state_cb = TRAIN.WindowStateCallback(state_path=state_path, checkpoint_dir=checkpoints_dir, window=window)
-    progress_cb = TRAIN.TQDMProgressBar(refresh_rate=10)
+    state_cb = WindowStateCallback(
+        state_path=state_path, checkpoint_dir=checkpoints_dir, window=window
+    )
+    progress_cb = TQDMProgressBar(refresh_rate=10)
 
-    csv_logger = TRAIN.CSVLogger(save_dir=str(logs_dir), name="lightning")
+    csv_logger = CSVLogger(save_dir=str(logs_dir), name="lightning")
 
-    trainer = TRAIN.pl.Trainer(
-        accelerator="gpu" if use_gpu else "cpu",
+    trainer = pl.Trainer(
+        accelerator="auto",
         devices=1,
-        precision="16-mixed" if use_gpu else "32-true",
+        precision="16-mixed",
         max_epochs=cfg.max_epochs,
         logger=csv_logger,
         callbacks=[early_stop, best_ckpt_cb, step_ckpt_cb, state_cb, progress_cb],
@@ -991,7 +1098,7 @@ def run_window_training_optimized(
         num_sanity_val_steps=0,
     )
 
-    model = TRAIN.TemporalFusionTransformer.from_dataset(
+    model = TemporalFusionTransformer.from_dataset(
         training_ds,
         learning_rate=cfg.learning_rate,
         hidden_size=cfg.hidden_size,
@@ -999,8 +1106,9 @@ def run_window_training_optimized(
         hidden_continuous_size=cfg.hidden_continuous_size,
         lstm_layers=cfg.lstm_layers,
         dropout=cfg.dropout,
-        loss=TRAIN.QuantileLoss(),
+        loss=QuantileLoss(),
         output_size=7,
+        # FP16-safe attention mask bias; default can overflow in 16-mixed on some GPUs.
         mask_bias=-1e4,
         log_interval=-1,
         log_val_interval=-1,
@@ -1013,16 +1121,16 @@ def run_window_training_optimized(
         if state_ckpt and Path(state_ckpt).exists():
             resume_ckpt = str(Path(state_ckpt))
         else:
-            latest = TRAIN.find_latest_checkpoint(checkpoints_dir)
+            latest = find_latest_checkpoint(checkpoints_dir)
             if latest is not None:
                 resume_ckpt = str(latest)
 
-    TRAIN.write_json(
+    write_json(
         state_path,
         {
             "window": window,
             "status": "training",
-            "started_at": TRAIN.now_utc_iso(),
+            "started_at": now_utc_iso(),
             "last_ckpt": resume_ckpt or "",
             "max_epochs": cfg.max_epochs,
         },
@@ -1030,32 +1138,28 @@ def run_window_training_optimized(
 
     try:
         logging.info(
-            "window=%s training start (max_epochs=%s, batch=%s, train_workers=%s, eval_workers=%s, "
-            "accumulate_grad_batches=%s, limit_val_batches=%s)",
+            "window=%s training start "
+            "(max_epochs=%s, batch=%s, accumulate_grad_batches=%s, limit_val_batches=%s)",
             window,
             cfg.max_epochs,
             batch_size,
-            train_workers,
-            eval_workers,
             cfg.accumulate_grad_batches,
             cfg.limit_val_batches,
         )
-        if resume_ckpt:
-            logging.info("window=%s resuming from checkpoint: %s", window, resume_ckpt)
-        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=resume_ckpt)
+        trainer.fit(
+            model,
+            train_dataloaders=train_loader,
+            val_dataloaders=val_loader,
+            ckpt_path=resume_ckpt,
+        )
     except KeyboardInterrupt:
-        interrupted_ckpt = checkpoints_dir / "interrupt.ckpt"
-        try:
-            trainer.save_checkpoint(str(interrupted_ckpt))
-        except Exception:
-            interrupted_ckpt = None
-        latest = interrupted_ckpt if interrupted_ckpt is not None and interrupted_ckpt.exists() else TRAIN.find_latest_checkpoint(checkpoints_dir)
-        TRAIN.write_json(
+        latest = find_latest_checkpoint(checkpoints_dir)
+        write_json(
             state_path,
             {
                 "window": window,
                 "status": "interrupted",
-                "updated_at": TRAIN.now_utc_iso(),
+                "updated_at": now_utc_iso(),
                 "last_ckpt": str(latest) if latest else "",
                 "last_epoch_completed": int(trainer.current_epoch),
                 "global_step": int(trainer.global_step),
@@ -1064,18 +1168,13 @@ def run_window_training_optimized(
         )
         raise
     except Exception as exc:
-        failed_ckpt = checkpoints_dir / "failed.ckpt"
-        try:
-            trainer.save_checkpoint(str(failed_ckpt))
-        except Exception:
-            failed_ckpt = None
-        latest = failed_ckpt if failed_ckpt is not None and failed_ckpt.exists() else TRAIN.find_latest_checkpoint(checkpoints_dir)
-        TRAIN.write_json(
+        latest = find_latest_checkpoint(checkpoints_dir)
+        write_json(
             state_path,
             {
                 "window": window,
                 "status": "failed",
-                "updated_at": TRAIN.now_utc_iso(),
+                "updated_at": now_utc_iso(),
                 "last_ckpt": str(latest) if latest else "",
                 "last_epoch_completed": int(trainer.current_epoch),
                 "global_step": int(trainer.global_step),
@@ -1087,17 +1186,19 @@ def run_window_training_optimized(
 
     best_ckpt = best_ckpt_cb.best_model_path
     if not best_ckpt:
-        latest = TRAIN.find_latest_checkpoint(checkpoints_dir)
+        latest = find_latest_checkpoint(checkpoints_dir)
         if latest is None:
-            raise RuntimeError(f"window={window}: no checkpoint found after training.")
+            raise RuntimeError(
+                f"window={window}: no checkpoint found after training."
+            )
         best_ckpt = str(latest)
 
-    TRAIN.write_json(
+    write_json(
         state_path,
         {
             "window": window,
             "status": "trained",
-            "updated_at": TRAIN.now_utc_iso(),
+            "updated_at": now_utc_iso(),
             "best_ckpt": best_ckpt,
             "last_epoch_completed": int(trainer.current_epoch),
             "global_step": int(trainer.global_step),
@@ -1107,7 +1208,7 @@ def run_window_training_optimized(
         },
     )
 
-    TRAIN.evaluate_window_and_write_outputs(
+    evaluate_window_and_write_outputs(
         window=window,
         prediction_length=cfg.prediction_length,
         work_df=work_df,
@@ -1120,103 +1221,988 @@ def run_window_training_optimized(
     )
 
 
-def run_train_test_mode(
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — HYPERPARAMETER TUNING
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class TuneConfig:
+    data_path: Path
+    artifact_root: Path
+    windows: List[int]
+    prediction_length: int
+    n_trials: int
+    max_total_trials: Optional[int]
+    max_epochs: int
+    patience: int
+    num_workers: int
+    seed: int
+    study_prefix: str
+    timeout_seconds: Optional[int]
+    accumulate_grad_batches: int
+    limit_val_batches: int
+    eval_test_metrics: bool
+
+
+def pick_precision_sequence() -> List[str]:
+    """
+    Prefer 16-mixed on CUDA for RTX 3050-class GPUs.
+    Keep a deterministic order so effective precision is recorded per trial.
+    """
+    if torch.cuda.is_available():
+        return ["16-mixed"]
+    return ["32-true"]
+
+
+def pick_loader_workers(requested_workers: int) -> Tuple[int, int]:
+    """
+    Choose worker counts for train and eval dataloaders.
+    If requested_workers < 0, auto-tune based on host CPU.
+    """
+    if requested_workers < 0:
+        train_workers = 4
+    else:
+        train_workers = max(0, int(requested_workers))
+    eval_workers = max(0, train_workers // 2)
+    return train_workers, eval_workers
+
+
+def is_probable_oom(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda error: out of memory" in msg
+
+
+def is_probable_bf16_issue(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    keywords = ["bf16", "bfloat16", "bfloat", "unsupported", "amp"]
+    return any(k in msg for k in keywords)
+
+
+def compute_per_symbol_equal_direction_metrics(
+    true_returns: np.ndarray,
+    pred_returns: np.ndarray,
+    symbols: np.ndarray,
+) -> Tuple[float, float]:
+    """
+    Compute per-symbol-equal-weight Directional Accuracy and F1_Up on return space.
+    For 1-step predictions, we use the first horizon column.
+    """
+    if true_returns.ndim == 2:
+        y_true = true_returns[:, 0]
+    else:
+        y_true = true_returns.reshape(-1)
+
+    if pred_returns.ndim == 2:
+        y_pred = pred_returns[:, 0]
+    else:
+        y_pred = pred_returns.reshape(-1)
+
+    valid = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not np.any(valid):
+        return float("nan"), float("nan")
+
+    y_true = y_true[valid]
+    y_pred = y_pred[valid]
+    sym_valid = symbols[valid]
+
+    per_symbol_da: List[float] = []
+    per_symbol_f1: List[float] = []
+    for sym in np.unique(sym_valid):
+        m = sym_valid == sym
+        if not np.any(m):
+            continue
+        d = compute_direction_metrics(y_true[m], y_pred[m])
+        per_symbol_da.append(float(d["directional_accuracy"]))
+        per_symbol_f1.append(float(d["f1_up"]))
+
+    if not per_symbol_da:
+        return float("nan"), float("nan")
+
+    return float(np.mean(per_symbol_da)), float(np.mean(per_symbol_f1))
+
+
+class WindowObjective:
+    """Optuna objective for a single encoder window."""
+
+    def __init__(
+        self,
+        cfg: TuneConfig,
+        window: int,
+        train_ds: TimeSeriesDataSet,
+        val_ds: TimeSeriesDataSet,
+        test_ds: TimeSeriesDataSet,
+        work_df: pd.DataFrame,
+        window_dir: Path,
+    ) -> None:
+        self.cfg = cfg
+        self.window = window
+        self.train_ds = train_ds
+        self.val_ds = val_ds
+        self.test_ds = test_ds
+        self.work_df = work_df
+        self.window_dir = window_dir
+
+    def __call__(self, trial: optuna.trial.Trial) -> float:
+        batch_size = WINDOW_BATCH_SIZE.get(self.window, 64)
+        train_workers, eval_workers = pick_loader_workers(self.cfg.num_workers)
+        train_loader_kwargs: Dict = {
+            "train": True,
+            "batch_size": batch_size,
+            "num_workers": train_workers,
+            "persistent_workers": train_workers > 0,
+            "pin_memory": torch.cuda.is_available(),
+        }
+        eval_loader_kwargs: Dict = {
+            "train": False,
+            "batch_size": batch_size,
+            "num_workers": eval_workers,
+            "persistent_workers": eval_workers > 0,
+            "pin_memory": torch.cuda.is_available(),
+        }
+        if train_workers > 0:
+            train_loader_kwargs["prefetch_factor"] = 2
+            train_loader_kwargs["multiprocessing_context"] = "fork"
+        if eval_workers > 0:
+            eval_loader_kwargs["prefetch_factor"] = 2
+            eval_loader_kwargs["multiprocessing_context"] = "fork"
+
+        # ── Search space ────────────────────────────────────────────────────
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+        hidden_size = trial.suggest_categorical("hidden_size_v2", [16, 32, 48])
+        hidden_continuous_size_raw = trial.suggest_categorical(
+            "hidden_continuous_size_v2", [8, 16, 24]
+        )
+        attention_head_size_raw = trial.suggest_categorical(
+            "attention_head_size_v2", [1, 2, 4]
+        )
+
+        # Keep Optuna distributions static across trials, then map raw samples to
+        # values compatible with this trial's hidden_size.
+        hc_candidates = [x for x in [8, 16, 24] if x <= hidden_size]
+        hidden_continuous_size = max(
+            [x for x in hc_candidates if x <= hidden_continuous_size_raw],
+            default=hc_candidates[0],
+        )
+
+        head_candidates = [h for h in [1, 2, 4] if hidden_size % h == 0]
+        attention_head_size = max(
+            [h for h in head_candidates if h <= attention_head_size_raw],
+            default=head_candidates[0],
+        )
+
+        if hidden_continuous_size != hidden_continuous_size_raw:
+            trial.set_user_attr(
+                "hidden_continuous_size_adjusted_from", int(hidden_continuous_size_raw)
+            )
+        if attention_head_size != attention_head_size_raw:
+            trial.set_user_attr(
+                "attention_head_size_adjusted_from", int(attention_head_size_raw)
+            )
+        trial.set_user_attr("effective_hidden_size", int(hidden_size))
+        trial.set_user_attr(
+            "effective_hidden_continuous_size", int(hidden_continuous_size)
+        )
+        trial.set_user_attr(
+            "effective_attention_head_size", int(attention_head_size)
+        )
+
+        dropout = trial.suggest_float("dropout", 0.1, 0.4)
+        gradient_clip_val = trial.suggest_float("gradient_clip_val", 0.1, 1.0)
+
+        trial_dir = self.window_dir / "trials" / f"trial_{trial.number:05d}"
+        checkpoints_dir = trial_dir / "checkpoints"
+        ensure_dir(checkpoints_dir)
+
+        train_loader = self.train_ds.to_dataloader(**train_loader_kwargs)
+        val_loader = self.val_ds.to_dataloader(**eval_loader_kwargs)
+        test_loader = (
+            self.test_ds.to_dataloader(**eval_loader_kwargs)
+            if self.cfg.eval_test_metrics
+            else None
+        )
+
+        early_stop = EarlyStopping(
+            monitor="val_loss",
+            mode="min",
+            patience=self.cfg.patience,
+            min_delta=1e-4,
+            verbose=False,
+        )
+        best_ckpt_cb = ModelCheckpoint(
+            dirpath=str(checkpoints_dir),
+            filename="best-epoch{epoch:03d}-valloss{val_loss:.6f}",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=1,
+            save_last=True,
+            every_n_epochs=1,
+            auto_insert_metric_name=False,
+        )
+        prune_cb = PyTorchLightningPruningCallback(trial, monitor="val_loss")
+        progress_cb = TQDMProgressBar(refresh_rate=50)
+
+        precision_attempts = pick_precision_sequence()
+        last_exc: Optional[BaseException] = None
+        best_score: Optional[float] = None
+        best_ckpt_path: Optional[str] = None
+        effective_precision: Optional[str] = None
+
+        for idx, precision in enumerate(precision_attempts):
+            model = None
+            trainer = None
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                model = TemporalFusionTransformer.from_dataset(
+                    self.train_ds,
+                    learning_rate=learning_rate,
+                    hidden_size=hidden_size,
+                    attention_head_size=attention_head_size,
+                    hidden_continuous_size=hidden_continuous_size,
+                    lstm_layers=1 if self.window <= 10 else 2,
+                    dropout=dropout,
+                    loss=QuantileLoss(),
+                    output_size=7,
+                    mask_bias=-1e4,
+                    log_interval=-1,
+                    log_val_interval=-1,
+                    reduce_on_plateau_patience=2,
+                )
+
+                trainer = pl.Trainer(
+                    accelerator="auto",
+                    devices=1,
+                    precision=precision,
+                    max_epochs=self.cfg.max_epochs,
+                    logger=False,
+                    callbacks=[early_stop, best_ckpt_cb, prune_cb, progress_cb],
+                    gradient_clip_val=gradient_clip_val,
+                    accumulate_grad_batches=self.cfg.accumulate_grad_batches,
+                    limit_val_batches=self.cfg.limit_val_batches,
+                    deterministic=False,
+                    benchmark=True,
+                    enable_model_summary=False,
+                    log_every_n_steps=100,
+                    num_sanity_val_steps=0,
+                    enable_checkpointing=True,
+                )
+
+                trainer.fit(
+                    model,
+                    train_dataloaders=train_loader,
+                    val_dataloaders=val_loader,
+                )
+
+                if best_ckpt_cb.best_model_score is not None:
+                    best_score = float(best_ckpt_cb.best_model_score.item())
+                else:
+                    v = trainer.callback_metrics.get("val_loss")
+                    best_score = (
+                        float(v.item()) if v is not None else float("inf")
+                    )
+
+                if best_ckpt_cb.best_model_path:
+                    best_ckpt_path = best_ckpt_cb.best_model_path
+                else:
+                    # Fallback to last checkpoint in trial directory.
+                    ckpts = sorted(
+                        checkpoints_dir.glob("*.ckpt"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    best_ckpt_path = str(ckpts[0]) if ckpts else None
+
+                effective_precision = precision
+                break
+
+            except optuna.TrialPruned:
+                # Keep pruning behaviour strict.
+                raise
+            except RuntimeError as exc:
+                last_exc = exc
+                if is_probable_oom(exc):
+                    trial.set_user_attr("oom", True)
+                    trial.set_user_attr("failed_precision", precision)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    raise optuna.TrialPruned("Trial pruned due to OOM")
+
+                # Only fall back to next precision attempt if this looks
+                # precision-related and more attempts remain.
+                if idx < len(precision_attempts) - 1 and is_probable_bf16_issue(exc):
+                    trial.set_user_attr("bf16_fallback", True)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                raise
+            except Exception as exc:
+                last_exc = exc
+                raise
+            finally:
+                if trainer is not None:
+                    del trainer
+                if model is not None:
+                    del model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        if best_score is None:
+            if last_exc is not None:
+                raise RuntimeError(
+                    f"Trial failed before producing val_loss: {last_exc}"
+                )
+            raise RuntimeError("Trial failed before producing val_loss")
+
+        trial.set_user_attr("effective_precision", effective_precision)
+        if best_ckpt_path:
+            trial.set_user_attr("best_checkpoint", best_ckpt_path)
+
+        # Optional extra metrics (expensive). Disabled by default for faster tuning.
+        if (
+            self.cfg.eval_test_metrics
+            and best_ckpt_path
+            and test_loader is not None
+        ):
+            best_model = TemporalFusionTransformer.load_from_checkpoint(
+                best_ckpt_path
+            )
+            pred_output = best_model.predict(
+                test_loader,
+                mode="prediction",
+                return_index=True,
+                trainer_kwargs={"logger": False, "enable_checkpointing": False},
+            )
+            pred_returns, pred_index = unpack_prediction_output(pred_output)
+            pred_returns = pred_returns[
+                :, : self.cfg.prediction_length
+            ].astype(np.float64)
+
+            symbols, _, _, true_returns, _, _ = build_truth_and_price_matrices(
+                pred_returns=pred_returns,
+                pred_index=pred_index,
+                base_df=self.work_df[
+                    [SYMBOL_COL, TIME_IDX_COL, TARGET_COL, PRICE_COL, DATE_COL]
+                ].copy(),
+                prediction_length=self.cfg.prediction_length,
+            )
+            da_eq, f1_eq = compute_per_symbol_equal_direction_metrics(
+                true_returns=true_returns,
+                pred_returns=pred_returns,
+                symbols=symbols,
+            )
+            trial.set_user_attr("Directional_Accuracy", da_eq)
+            trial.set_user_attr("F1_Up", f1_eq)
+            del best_model
+
+        del train_loader, val_loader, test_loader
+        gc.collect()
+        return best_score
+
+
+def export_trials_csv(study: optuna.Study, out_path: Path) -> None:
+    ensure_dir(out_path.parent)
+    df = study.trials_dataframe(
+        attrs=(
+            "number",
+            "value",
+            "state",
+            "params",
+            "user_attrs",
+            "datetime_start",
+            "datetime_complete",
+        )
+    )
+    df.to_csv(out_path, index=False)
+
+
+def print_window_summary(study: optuna.Study, window: int) -> None:
+    log = logging.getLogger(__name__)
+    if study.best_trial is None:
+        log.warning("window=%s: no best trial available.", window)
+        return
+
+    best = study.best_trial
+    log.info(
+        "window=%s best trial=%s val_loss=%.8f",
+        window,
+        best.number,
+        float(best.value),
+    )
+    log.info("window=%s best params=%s", window, best.params)
+    log.info(
+        "window=%s best attrs: F1_Up=%s Directional_Accuracy=%s effective_precision=%s",
+        window,
+        best.user_attrs.get("F1_Up"),
+        best.user_attrs.get("Directional_Accuracy"),
+        best.user_attrs.get("effective_precision"),
+    )
+
+    completed = [
+        t
+        for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+    ]
+
+    def top_trials_by_attr(attr: str, n: int = 5) -> list:
+        scored = [
+            t
+            for t in completed
+            if attr in t.user_attrs and t.user_attrs.get(attr) is not None
+        ]
+        scored = [
+            t
+            for t in scored
+            if isinstance(t.user_attrs.get(attr), (int, float))
+            and np.isfinite(t.user_attrs.get(attr))
+        ]
+        scored.sort(key=lambda t: float(t.user_attrs[attr]), reverse=True)
+        return scored[:n]
+
+    top_f1 = top_trials_by_attr("F1_Up")
+    top_da = top_trials_by_attr("Directional_Accuracy")
+
+    if top_f1:
+        log.info("window=%s top trials by F1_Up:", window)
+        for t in top_f1:
+            log.info(
+                "  trial=%s F1_Up=%.6f val_loss=%.8f",
+                t.number,
+                float(t.user_attrs["F1_Up"]),
+                float(t.value),
+            )
+
+    if top_da:
+        log.info("window=%s top trials by Directional_Accuracy:", window)
+        for t in top_da:
+            log.info(
+                "  trial=%s Directional_Accuracy=%.6f val_loss=%.8f",
+                t.number,
+                float(t.user_attrs["Directional_Accuracy"]),
+                float(t.value),
+            )
+
+
+def tune_window(cfg: TuneConfig, base_df: pd.DataFrame, window: int) -> Dict:
+    log = logging.getLogger(__name__)
+
+    window_dir = cfg.artifact_root / f"window_{window}"
+    ensure_dir(window_dir)
+
+    train_ds, val_ds, test_ds, work_df = build_datasets_for_window(
+        df=base_df,
+        encoder_length=window,
+        prediction_length=cfg.prediction_length,
+    )
+
+    study_name = f"{cfg.study_prefix}{window}"
+    study_db_path = window_dir / "study.db"
+    storage_url = (
+        f"sqlite:///{study_db_path.resolve()}?timeout=30&_journal_mode=WAL"
+    )
+
+    sampler = optuna.samplers.TPESampler(seed=cfg.seed)
+    pruner = optuna.pruners.MedianPruner(
+        n_startup_trials=5, n_warmup_steps=3, interval_steps=1
+    )
+
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_url,
+        direction="minimize",
+        sampler=sampler,
+        pruner=pruner,
+        load_if_exists=True,
+    )
+
+    objective = WindowObjective(
+        cfg=cfg,
+        window=window,
+        train_ds=train_ds,
+        val_ds=val_ds,
+        test_ds=test_ds,
+        work_df=work_df,
+        window_dir=window_dir,
+    )
+
+    existing_trials = len(study.trials)
+    n_trials_to_run = cfg.n_trials
+    if cfg.max_total_trials is not None:
+        remaining = max(0, int(cfg.max_total_trials) - existing_trials)
+        n_trials_to_run = min(n_trials_to_run, remaining)
+
+    log.info(
+        "window=%s tuning start "
+        "(existing_trials=%s, n_trials_this_run=%s, max_total_trials=%s, "
+        "timeout_seconds=%s)",
+        window,
+        existing_trials,
+        n_trials_to_run,
+        cfg.max_total_trials,
+        cfg.timeout_seconds,
+    )
+
+    if n_trials_to_run <= 0:
+        log.info(
+            "window=%s already reached max_total_trials=%s "
+            "(existing_trials=%s). Skipping optimize.",
+            window,
+            cfg.max_total_trials,
+            existing_trials,
+        )
+        export_trials_csv(study, window_dir / "trials.csv")
+        print_window_summary(study, window)
+        return {
+            "window": window,
+            "study_name": study_name,
+            "study_db": str(study_db_path),
+            "n_trials_total": len(study.trials),
+            "best_val_loss": float(study.best_trial.value)
+            if study.best_trial is not None
+            else None,
+            "best_trial_number": int(study.best_trial.number)
+            if study.best_trial is not None
+            else None,
+        }
+
+    stop_state: Dict = {"requested": False, "sigint_count": 0}
+    prev_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def _sigint_handler(signum, frame) -> None:
+        stop_state["sigint_count"] += 1
+        if stop_state["sigint_count"] == 1:
+            stop_state["requested"] = True
+            log.warning(
+                "window=%s SIGINT received: will stop after current trial "
+                "completes (press Ctrl+C again to force stop).",
+                window,
+            )
+            return
+        # Second Ctrl+C: force immediate interruption.
+        raise KeyboardInterrupt
+
+    def _stop_after_trial_cb(
+        study_: optuna.Study, trial_: optuna.trial.FrozenTrial
+    ) -> None:
+        if stop_state["requested"]:
+            study_.stop()
+
+    try:
+        signal.signal(signal.SIGINT, _sigint_handler)
+        study.optimize(
+            objective,
+            n_trials=n_trials_to_run,
+            timeout=cfg.timeout_seconds,
+            gc_after_trial=True,
+            show_progress_bar=True,
+            callbacks=[_stop_after_trial_cb],
+        )
+    except KeyboardInterrupt:
+        log.warning(
+            "window=%s tuning interrupted by user. "
+            "Study is safely persisted in %s",
+            window,
+            study_db_path,
+        )
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint_handler)
+
+    export_trials_csv(study, window_dir / "trials.csv")
+    print_window_summary(study, window)
+
+    best_payload: Dict = {}
+    if study.best_trial is not None:
+        best_payload = {
+            "window": window,
+            "best_trial_number": int(study.best_trial.number),
+            "best_val_loss": float(study.best_trial.value),
+            "best_params": dict(study.best_trial.params),
+            "best_user_attrs": dict(study.best_trial.user_attrs),
+            "updated_at": now_utc_iso(),
+            "study_db": str(study_db_path),
+        }
+        write_json(window_dir / "best_trial.json", best_payload)
+
+    return {
+        "window": window,
+        "study_name": study_name,
+        "study_db": str(study_db_path),
+        "n_trials_total": len(study.trials),
+        "best_val_loss": float(study.best_trial.value)
+        if study.best_trial is not None
+        else None,
+        "best_trial_number": int(study.best_trial.number)
+        if study.best_trial is not None
+        else None,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — UNIFIED CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class UnifiedConfig:
+    """Single config that encompasses all fields from RunConfig and TuneConfig.
+
+    Fields that have different defaults between training and tuning are given
+    distinct names (e.g. ``train_max_epochs`` vs ``tune_max_epochs``) so that
+    both defaults can be expressed independently in the CLI.
+    """
+
+    # ── shared ───────────────────────────────────────────────────────────────
+    data_path: Path
+    windows: List[int]
+    prediction_length: int
+    num_workers: int
+    seed: int
+    no_window_menu: bool
+
+    # ── training-specific ────────────────────────────────────────────────────
+    train_artifact_root: Path
+    train_max_epochs: int          # default 50
+    train_patience: int            # default 8
+    learning_rate: float
+    hidden_size: int
+    hidden_continuous_size: int
+    attention_head_size: int
+    lstm_layers: int
+    dropout: float
+    gradient_clip_val: float
+    force_retrain: bool
+    train_limit_val_batches: int   # default 200
+    train_accumulate_grad_batches: int  # default 2
+
+    # ── tuning-specific ──────────────────────────────────────────────────────
+    tune_artifact_root: Path
+    tune_max_epochs: int           # default 8
+    tune_patience: int             # default 3
+    n_trials: int
+    max_total_trials: Optional[int]
+    study_prefix: str
+    timeout_seconds: Optional[int]
+    tune_accumulate_grad_batches: int   # default 1
+    tune_limit_val_batches: int         # default 50
+    eval_test_metrics: bool
+
+
+def make_run_config(
     cfg: UnifiedConfig,
-    base_df: pd.DataFrame,
-    require_tuned: bool,
-    use_gpu: bool,
-) -> None:
-    TRAIN.ensure_dir(cfg.train_artifact_root)
+    windows: Optional[List[int]] = None,
+    hp_overrides: Optional[Dict] = None,
+) -> RunConfig:
+    """
+    Construct a RunConfig from UnifiedConfig.
+
+    ``windows`` overrides cfg.windows (used to pass a single-window list per
+    loop iteration while keeping the unified config intact).
+
+    ``hp_overrides`` is a dict of model HP values sourced from a completed
+    Optuna study (see ``load_tuned_hps_for_window``).  When provided, the
+    corresponding RunConfig fields are replaced; all other fields use the
+    UnifiedConfig values unchanged.
+    """
+    ovr: Dict = hp_overrides or {}
+    return RunConfig(
+        data_path=cfg.data_path,
+        artifact_root=cfg.train_artifact_root,
+        windows=windows if windows is not None else cfg.windows,
+        prediction_length=cfg.prediction_length,
+        max_epochs=cfg.train_max_epochs,
+        patience=cfg.train_patience,
+        num_workers=cfg.num_workers,
+        seed=cfg.seed,
+        learning_rate=float(ovr.get("learning_rate", cfg.learning_rate)),
+        hidden_size=int(ovr.get("hidden_size", cfg.hidden_size)),
+        hidden_continuous_size=int(
+            ovr.get("hidden_continuous_size", cfg.hidden_continuous_size)
+        ),
+        attention_head_size=int(
+            ovr.get("attention_head_size", cfg.attention_head_size)
+        ),
+        lstm_layers=int(ovr.get("lstm_layers", cfg.lstm_layers)),
+        dropout=float(ovr.get("dropout", cfg.dropout)),
+        gradient_clip_val=float(
+            ovr.get("gradient_clip_val", cfg.gradient_clip_val)
+        ),
+        force_retrain=cfg.force_retrain,
+        limit_val_batches=cfg.train_limit_val_batches,
+        accumulate_grad_batches=cfg.train_accumulate_grad_batches,
+    )
+
+
+def make_tune_config(cfg: UnifiedConfig) -> TuneConfig:
+    """Construct a TuneConfig from UnifiedConfig."""
+    return TuneConfig(
+        data_path=cfg.data_path,
+        artifact_root=cfg.tune_artifact_root,
+        windows=cfg.windows,
+        prediction_length=cfg.prediction_length,
+        n_trials=cfg.n_trials,
+        max_total_trials=cfg.max_total_trials,
+        max_epochs=cfg.tune_max_epochs,
+        patience=cfg.tune_patience,
+        num_workers=cfg.num_workers,
+        seed=cfg.seed,
+        study_prefix=cfg.study_prefix,
+        timeout_seconds=cfg.timeout_seconds,
+        accumulate_grad_batches=cfg.tune_accumulate_grad_batches,
+        limit_val_batches=cfg.tune_limit_val_batches,
+        eval_test_metrics=cfg.eval_test_metrics,
+    )
+
+
+def load_tuned_hps_for_window(
+    window: int, tune_artifact_root: Path
+) -> Optional[Dict]:
+    """
+    Load best hyperparameters from a completed Optuna tuning run for one window.
+
+    Reads ``<tune_artifact_root>/window_<window>/best_trial.json`` which is
+    written by ``tune_window`` after each study completes.
+
+    Returns a dict with keys matching RunConfig model-HP fields, or None if no
+    best_trial.json exists for this window.
+    """
+    best_trial_path = tune_artifact_root / f"window_{window}" / "best_trial.json"
+    if not best_trial_path.exists():
+        return None
+
+    data = read_json(best_trial_path)
+    params = data.get("best_params", {})
+    user_attrs = data.get("best_user_attrs", {})
+
+    # Effective values (post-constraint) are stored in user_attrs.
+    # Fall back to raw param values if user_attrs are missing.
+    hps = {
+        "learning_rate": float(params.get("learning_rate", 1e-3)),
+        "hidden_size": int(
+            user_attrs.get(
+                "effective_hidden_size", params.get("hidden_size_v2", 32)
+            )
+        ),
+        "hidden_continuous_size": int(
+            user_attrs.get(
+                "effective_hidden_continuous_size",
+                params.get("hidden_continuous_size_v2", 16),
+            )
+        ),
+        "attention_head_size": int(
+            user_attrs.get(
+                "effective_attention_head_size",
+                params.get("attention_head_size_v2", 4),
+            )
+        ),
+        # lstm_layers was not part of the Optuna search space; replicate the
+        # tuner's fixed rule (1 for short windows, 2 for longer ones).
+        "lstm_layers": 1 if window <= 10 else 2,
+        "dropout": float(params.get("dropout", 0.2)),
+        "gradient_clip_val": float(params.get("gradient_clip_val", 0.5)),
+    }
+    logging.info(
+        "window=%s loaded tuned HPs from %s: %s", window, best_trial_path, hps
+    )
+    return hps
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — CLI & MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def show_main_menu() -> int:
+    """Display the top-level interactive mode menu and return the chosen mode."""
+    lines = [
+        "",
+        "TFT Unified Pipeline — Select Mode:",
+        "  [0] Hyperparameter tuning  → then training/testing",
+        "  [1] Training/testing only  (loads tuned HPs when available)",
+        "  [2] Inference only",
+        "  [3] Exit",
+    ]
+    print("\n".join(lines))
+
+    while True:
+        try:
+            choice = input("Enter choice (0-3): ").strip()
+        except EOFError:
+            logging.info(
+                "No interactive input detected. Defaulting to mode 1 "
+                "(training/testing only)."
+            )
+            return 1
+
+        if choice in ("0", "1", "2", "3"):
+            return int(choice)
+
+        print("Invalid choice. Please enter 0, 1, 2, or 3.")
+
+
+def run_tuning_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
+    """
+    Run Optuna hyperparameter tuning for all selected windows, then optionally
+    proceed to training/testing with the best discovered hyperparameters.
+    """
+    tune_cfg = make_tune_config(cfg)
+    ensure_dir(tune_cfg.artifact_root)
+
+    # Reduce file descriptor pressure from DataLoader shared-memory handles.
+    try:
+        torch.multiprocessing.set_sharing_strategy("file_system")
+    except Exception:
+        pass
+    try:
+        torch.set_num_threads(4)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    summary_rows: List[Dict] = []
+    for window in tune_cfg.windows:
+        try:
+            row = tune_window(cfg=tune_cfg, base_df=base_df, window=window)
+            summary_rows.append(row)
+        except Exception as exc:
+            logging.error("window=%s tuning failed: %s", window, exc)
+            logging.debug("Traceback:\n%s", traceback.format_exc())
+            summary_rows.append(
+                {
+                    "window": window,
+                    "study_name": f"{tune_cfg.study_prefix}{window}",
+                    "study_db": str(
+                        tune_cfg.artifact_root / f"window_{window}" / "study.db"
+                    ),
+                    "n_trials_total": None,
+                    "best_val_loss": None,
+                    "best_trial_number": None,
+                    "error": str(exc),
+                }
+            )
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = tune_cfg.artifact_root / "tuning_summary.csv"
+    summary_df.to_csv(summary_path, index=False)
+    logging.info("Saved tuning summary -> %s", summary_path)
+
+    # Prompt whether to proceed to training with the tuned HPs.
+    try:
+        proceed = (
+            input(
+                "\nTuning complete. Proceed to training/testing with tuned HPs? [Y/n]: "
+            )
+            .strip()
+            .lower()
+        )
+    except EOFError:
+        proceed = "y"
+
+    if proceed in ("", "y", "yes"):
+        run_train_test_mode(cfg=cfg, base_df=base_df)
+    else:
+        logging.info("Skipping training/testing.")
+
+
+def run_train_test_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
+    """
+    Run full training and testing for all selected windows.
+
+    For each window, attempts to load previously tuned HPs from
+    ``cfg.tune_artifact_root``.  If found, they override the default model
+    architecture HPs for that window; otherwise the CLI defaults are used.
+    """
+    ensure_dir(cfg.train_artifact_root)
+
+    # Resolve window list (apply interactive menu unless suppressed).
+    windows = cfg.windows
+    if not cfg.no_window_menu:
+        windows = choose_windows_menu(default_windows=windows)
 
     all_metrics: List[Dict] = []
-    for window in tqdm(cfg.windows, desc="Training windows", unit="window"):
-        effective_hp, source, source_path = resolve_effective_hparams(
-            cfg=cfg,
-            window=window,
-            require_tuned=require_tuned,
+    for window in tqdm(windows, desc="Training windows", unit="window"):
+        hp_overrides = load_tuned_hps_for_window(
+            window=window, tune_artifact_root=cfg.tune_artifact_root
         )
+        if hp_overrides:
+            logging.info("window=%s using tuned HPs from Optuna study.", window)
+        else:
+            logging.info(
+                "window=%s no tuned HPs found — using CLI/default HPs.", window
+            )
 
-        logging.info(
-            "window=%s hyperparameters source=%s path=%s lr=%.8f hidden_size=%s hidden_continuous_size=%s "
-            "attention_head_size=%s lstm_layers=%s dropout=%.6f gradient_clip_val=%.6f",
-            window,
-            source,
-            str(source_path) if source_path else "-",
-            float(effective_hp["learning_rate"]),
-            int(effective_hp["hidden_size"]),
-            int(effective_hp["hidden_continuous_size"]),
-            int(effective_hp["attention_head_size"]),
-            int(effective_hp["lstm_layers"]),
-            float(effective_hp["dropout"]),
-            float(effective_hp["gradient_clip_val"]),
-        )
-
-        run_cfg = TRAIN.RunConfig(
-            data_path=cfg.data_path,
-            artifact_root=cfg.train_artifact_root,
-            windows=[window],
-            prediction_length=int(cfg.prediction_length),
-            max_epochs=int(cfg.train_max_epochs),
-            patience=int(cfg.train_patience),
-            num_workers=int(cfg.train_num_workers),
-            seed=int(cfg.seed),
-            learning_rate=float(effective_hp["learning_rate"]),
-            hidden_size=int(effective_hp["hidden_size"]),
-            hidden_continuous_size=int(effective_hp["hidden_continuous_size"]),
-            attention_head_size=int(effective_hp["attention_head_size"]),
-            lstm_layers=int(effective_hp["lstm_layers"]),
-            dropout=float(effective_hp["dropout"]),
-            gradient_clip_val=float(effective_hp["gradient_clip_val"]),
-            force_retrain=False,
-            limit_val_batches=int(cfg.train_limit_val_batches),
-            accumulate_grad_batches=int(cfg.train_accumulate_grad_batches),
-        )
-
-        run_window_training_optimized(
-            cfg=run_cfg,
-            base_df=base_df,
-            window=window,
-            metrics_rows=all_metrics,
-            use_gpu=use_gpu,
+        run_cfg = make_run_config(cfg, windows=[window], hp_overrides=hp_overrides)
+        run_window_training(
+            cfg=run_cfg, base_df=base_df, window=window, metrics_rows=all_metrics
         )
 
     if not all_metrics:
-        logging.warning("No metrics produced. Check state files under %s", cfg.train_artifact_root)
+        logging.warning(
+            "No metrics produced. Check state files under %s",
+            cfg.train_artifact_root,
+        )
         return
 
     summary_df = pd.DataFrame(all_metrics)
-    summary_df = summary_df[TRAIN.FINAL_METRIC_COLUMNS].sort_values(["window"], kind="mergesort")
+    summary_df = summary_df[FINAL_METRIC_COLUMNS].sort_values(
+        ["window"], kind="mergesort"
+    )
     summary_path = cfg.train_artifact_root / "metrics_summary.csv"
     summary_df.to_csv(summary_path, index=False)
     logging.info("Saved global metrics summary -> %s", summary_path)
 
 
 def run_inference_only_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
-    TRAIN.ensure_dir(cfg.train_artifact_root)
+    """
+    Run inference only: for each selected window, locate the best checkpoint
+    under ``cfg.train_artifact_root`` and write test predictions + metrics.
+
+    No model training is performed.  Skips windows that have no checkpoint.
+    """
+    # Resolve window list.
+    windows = cfg.windows
+    if not cfg.no_window_menu:
+        windows = choose_windows_menu(default_windows=windows)
 
     all_metrics: List[Dict] = []
-    for window in tqdm(cfg.windows, desc="Inference windows", unit="window"):
+    for window in tqdm(windows, desc="Inference windows", unit="window"):
         window_dir = cfg.train_artifact_root / f"window_{window}"
         checkpoints_dir = window_dir / "checkpoints"
         state_path = window_dir / "state.json"
         metrics_path = window_dir / "metrics.csv"
 
-        TRAIN.ensure_dir(window_dir)
-        TRAIN.ensure_dir(checkpoints_dir)
+        # Locate best checkpoint (prefer state.json metadata, then filesystem scan).
+        state = read_json(state_path) if state_path.exists() else {}
+        best_ckpt = state.get("best_ckpt", "")
+        if not best_ckpt or not Path(best_ckpt).exists():
+            latest = find_latest_checkpoint(checkpoints_dir)
+            if latest is None:
+                logging.warning(
+                    "window=%s no checkpoint found under %s — skipping.",
+                    window,
+                    checkpoints_dir,
+                )
+                continue
+            best_ckpt = str(latest)
 
-        best_ckpt = resolve_checkpoint_for_inference(window_dir)
-        if best_ckpt is None:
-            logging.warning(
-                "window=%s inference skipped: no checkpoint found in %s",
-                window,
-                checkpoints_dir,
-            )
-            continue
+        logging.info(
+            "window=%s inference using checkpoint: %s", window, best_ckpt
+        )
 
-        logging.info("window=%s inference using checkpoint: %s", window, best_ckpt)
-        test_loader, work_df = build_test_loader_for_window(cfg=cfg, base_df=base_df, window=window)
+        _, _, test_ds, work_df = build_datasets_for_window(
+            df=base_df,
+            encoder_length=window,
+            prediction_length=cfg.prediction_length,
+        )
 
-        TRAIN.evaluate_window_and_write_outputs(
+        batch_size = WINDOW_BATCH_SIZE.get(window, 64)
+        test_loader = test_ds.to_dataloader(
+            train=False,
+            batch_size=batch_size,
+            num_workers=cfg.num_workers,
+            persistent_workers=cfg.num_workers > 0,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+        ensure_dir(window_dir)
+        evaluate_window_and_write_outputs(
             window=window,
             prediction_length=cfg.prediction_length,
             work_df=work_df,
@@ -1229,160 +2215,174 @@ def run_inference_only_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
         )
 
     if not all_metrics:
-        logging.warning("Inference mode finished with no windows processed. No checkpoints were available.")
+        logging.warning("No inference outputs produced.")
         return
 
     summary_df = pd.DataFrame(all_metrics)
-    summary_df = summary_df[TRAIN.FINAL_METRIC_COLUMNS].sort_values(["window"], kind="mergesort")
-    summary_path = cfg.train_artifact_root / "metrics_summary.csv"
+    summary_df = summary_df[FINAL_METRIC_COLUMNS].sort_values(
+        ["window"], kind="mergesort"
+    )
+    summary_path = cfg.train_artifact_root / "inference_summary.csv"
     summary_df.to_csv(summary_path, index=False)
-    logging.info("Saved inference metrics summary -> %s", summary_path)
-
-
-# --------------------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------------------
+    logging.info("Saved inference summary -> %s", summary_path)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Unified TFT: tune + train/test + inference",
+        description=(
+            "TFT Unified Pipeline — hyperparameter tuning, training/testing, "
+            "or inference on dataset/tft_ready.csv."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data-path", default=str(DEFAULT_DATA_PATH))
-    parser.add_argument("--train-artifact-root", default="artifacts/tft")
-    parser.add_argument("--tune-artifact-root", default="artifacts/tft_tune")
-    parser.add_argument("--windows", default="7,10,15,30")
-    parser.add_argument("--prediction-length", type=int, default=DEFAULT_PREDICTION_LENGTH)
-    parser.add_argument("--seed", type=int, default=42)
+
+    # ── mode (optional bypass of interactive menu) ───────────────────────────
     parser.add_argument(
-        "--allow-cpu-fallback",
-        action="store_true",
-        help="Allow CPU training/tuning when CUDA is unavailable. By default, modes 0/1 require GPU.",
+        "--mode",
+        type=int,
+        default=None,
+        choices=[0, 1, 2, 3],
+        help=(
+            "Run mode: 0=tune→train, 1=train-only, 2=inference-only, 3=exit. "
+            "Omit to show the interactive menu."
+        ),
     )
 
-    # Training controls (defaults mirror src/4_tft_train_test.py)
-    parser.add_argument("--train-max-epochs", type=int, default=50)
-    parser.add_argument("--train-patience", type=int, default=8)
-    parser.add_argument("--train-num-workers", type=int, default=4)
-    parser.add_argument("--train-learning-rate", type=float, default=1e-3)
-    parser.add_argument("--train-hidden-size", type=int, default=32)
-    parser.add_argument("--train-hidden-continuous-size", type=int, default=16)
-    parser.add_argument("--train-attention-head-size", type=int, default=4)
-    parser.add_argument("--train-lstm-layers", type=int, default=2)
-    parser.add_argument("--train-dropout", type=float, default=0.2)
-    parser.add_argument("--train-gradient-clip-val", type=float, default=0.5)
-    parser.add_argument("--train-limit-val-batches", type=int, default=200)
-    parser.add_argument("--train-accumulate-grad-batches", type=int, default=2)
+    # ── shared args ──────────────────────────────────────────────────────────
+    parser.add_argument("--data-path", default=str(DEFAULT_DATA_PATH))
+    parser.add_argument("--windows", default="7,10,15,30")
+    parser.add_argument(
+        "--no-window-menu",
+        action="store_true",
+        help="Skip the interactive encoder-window selector and use --windows directly.",
+    )
+    parser.add_argument(
+        "--prediction-length", type=int, default=DEFAULT_PREDICTION_LENGTH
+    )
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
 
-    # Tuning controls (defaults mirror src/5_tft_tune.py)
-    parser.add_argument("--tune-n-trials", type=int, default=30)
-    parser.add_argument("--tune-max-total-trials", type=int, default=None)
-    parser.add_argument("--tune-max-epochs", type=int, default=8)
-    parser.add_argument("--tune-patience", type=int, default=3)
-    parser.add_argument("--tune-num-workers", type=int, default=4)
-    parser.add_argument("--tune-study-prefix", default="tft_tune_w")
-    parser.add_argument("--tune-timeout-seconds", type=int, default=None)
-    parser.add_argument("--tune-accumulate-grad-batches", type=int, default=1)
-    parser.add_argument("--tune-limit-val-batches", type=int, default=50)
-    parser.add_argument("--tune-eval-test-metrics", action="store_true")
+    # ── training args ────────────────────────────────────────────────────────
+    train_grp = parser.add_argument_group("training")
+    train_grp.add_argument(
+        "--train-artifact-root", default=str(DEFAULT_TRAIN_ARTIFACT_ROOT)
+    )
+    train_grp.add_argument("--train-max-epochs", type=int, default=50)
+    train_grp.add_argument("--train-patience", type=int, default=8)
+    train_grp.add_argument("--learning-rate", type=float, default=1e-3)
+    train_grp.add_argument("--hidden-size", type=int, default=32)
+    train_grp.add_argument("--hidden-continuous-size", type=int, default=16)
+    train_grp.add_argument("--attention-head-size", type=int, default=4)
+    train_grp.add_argument("--lstm-layers", type=int, default=2)
+    train_grp.add_argument("--dropout", type=float, default=0.2)
+    train_grp.add_argument("--gradient-clip-val", type=float, default=0.5)
+    train_grp.add_argument("--force-retrain", action="store_true")
+    train_grp.add_argument("--train-limit-val-batches", type=int, default=200)
+    train_grp.add_argument("--train-accumulate-grad-batches", type=int, default=2)
+
+    # ── tuning args ──────────────────────────────────────────────────────────
+    tune_grp = parser.add_argument_group("tuning")
+    tune_grp.add_argument(
+        "--tune-artifact-root", default=str(DEFAULT_TUNE_ARTIFACT_ROOT)
+    )
+    tune_grp.add_argument("--tune-max-epochs", type=int, default=8)
+    tune_grp.add_argument("--tune-patience", type=int, default=3)
+    tune_grp.add_argument("--n-trials", type=int, default=30)
+    tune_grp.add_argument("--max-total-trials", type=int, default=None)
+    tune_grp.add_argument("--study-prefix", default="tft_tune_w")
+    tune_grp.add_argument("--timeout-seconds", type=int, default=None)
+    tune_grp.add_argument("--tune-accumulate-grad-batches", type=int, default=1)
+    tune_grp.add_argument("--tune-limit-val-batches", type=int, default=50)
+    tune_grp.add_argument("--eval-test-metrics", action="store_true")
 
     return parser
 
 
-def make_config(args: argparse.Namespace) -> UnifiedConfig:
-    windows = TRAIN.parse_windows(args.windows)
+def make_unified_config(args: argparse.Namespace) -> UnifiedConfig:
     return UnifiedConfig(
+        # shared
         data_path=Path(args.data_path),
-        train_artifact_root=Path(args.train_artifact_root),
-        tune_artifact_root=Path(args.tune_artifact_root),
-        windows=windows,
+        windows=parse_windows(args.windows),
         prediction_length=int(args.prediction_length),
+        num_workers=int(args.num_workers),
         seed=int(args.seed),
-        allow_cpu_fallback=bool(args.allow_cpu_fallback),
+        no_window_menu=bool(args.no_window_menu),
+        # training
+        train_artifact_root=Path(args.train_artifact_root),
         train_max_epochs=int(args.train_max_epochs),
         train_patience=int(args.train_patience),
-        train_num_workers=int(args.train_num_workers),
-        train_learning_rate=float(args.train_learning_rate),
-        train_hidden_size=int(args.train_hidden_size),
-        train_hidden_continuous_size=int(args.train_hidden_continuous_size),
-        train_attention_head_size=int(args.train_attention_head_size),
-        train_lstm_layers=int(args.train_lstm_layers),
-        train_dropout=float(args.train_dropout),
-        train_gradient_clip_val=float(args.train_gradient_clip_val),
+        learning_rate=float(args.learning_rate),
+        hidden_size=int(args.hidden_size),
+        hidden_continuous_size=int(args.hidden_continuous_size),
+        attention_head_size=int(args.attention_head_size),
+        lstm_layers=int(args.lstm_layers),
+        dropout=float(args.dropout),
+        gradient_clip_val=float(args.gradient_clip_val),
+        force_retrain=bool(args.force_retrain),
         train_limit_val_batches=int(args.train_limit_val_batches),
         train_accumulate_grad_batches=int(args.train_accumulate_grad_batches),
-        tune_n_trials=int(args.tune_n_trials),
-        tune_max_total_trials=int(args.tune_max_total_trials) if args.tune_max_total_trials is not None else None,
+        # tuning
+        tune_artifact_root=Path(args.tune_artifact_root),
         tune_max_epochs=int(args.tune_max_epochs),
         tune_patience=int(args.tune_patience),
-        tune_num_workers=int(args.tune_num_workers),
-        tune_study_prefix=str(args.tune_study_prefix),
-        tune_timeout_seconds=int(args.tune_timeout_seconds) if args.tune_timeout_seconds is not None else None,
+        n_trials=int(args.n_trials),
+        max_total_trials=(
+            int(args.max_total_trials)
+            if args.max_total_trials is not None
+            else None
+        ),
+        study_prefix=str(args.study_prefix),
+        timeout_seconds=(
+            int(args.timeout_seconds)
+            if args.timeout_seconds is not None
+            else None
+        ),
         tune_accumulate_grad_batches=int(args.tune_accumulate_grad_batches),
         tune_limit_val_batches=int(args.tune_limit_val_batches),
-        tune_eval_test_metrics=bool(args.tune_eval_test_metrics),
+        eval_test_metrics=bool(args.eval_test_metrics),
     )
-
-
-# --------------------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------------------
 
 
 def main() -> None:
+    configure_logging()
+    configure_warnings()
+
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+    os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "100000")
+
     parser = build_arg_parser()
     args = parser.parse_args()
-    cfg = make_config(args)
+    cfg = make_unified_config(args)
 
-    configure_runtime(seed=cfg.seed)
-
-    mode = choose_mode_menu()
-    if mode == "3":
-        logging.info("Exit selected by user.")
-        return
-
-    if not confirm_mode(mode):
-        logging.info("Operation cancelled by user.")
-        return
-
-    TRAIN.ensure_dir(cfg.train_artifact_root)
-    TRAIN.ensure_dir(cfg.tune_artifact_root)
+    torch.set_float32_matmul_precision("medium")
+    set_seed(cfg.seed)
 
     logging.info("Loading dataset from %s", cfg.data_path)
-    base_df = TRAIN.load_and_prepare_dataframe(cfg.data_path)
+    base_df = load_and_prepare_dataframe(cfg.data_path)
     logging.info(
         "Dataset shape=%s symbols=%s date_min=%s date_max=%s",
         base_df.shape,
-        base_df[TRAIN.SYMBOL_COL].nunique(),
-        base_df[TRAIN.DATE_COL].min().date(),
-        base_df[TRAIN.DATE_COL].max().date(),
+        base_df[SYMBOL_COL].nunique(),
+        base_df[DATE_COL].min().date(),
+        base_df[DATE_COL].max().date(),
     )
 
-    if mode == "0":
-        use_gpu = ensure_cuda_for_training_or_raise(
-            allow_cpu_fallback=cfg.allow_cpu_fallback,
-            mode_label="mode [0] Hyperparameter tuning + training/testing",
-        )
-        logging.info("Mode [0]: Hyperparameter tuning + training/testing")
+    # Mode selection: use --mode flag when provided, otherwise show menu.
+    if args.mode is not None:
+        mode = args.mode
+    else:
+        mode = show_main_menu()
+
+    if mode == 0:
         run_tuning_mode(cfg=cfg, base_df=base_df)
-        run_train_test_mode(cfg=cfg, base_df=base_df, require_tuned=True, use_gpu=use_gpu)
-        return
-
-    if mode == "1":
-        use_gpu = ensure_cuda_for_training_or_raise(
-            allow_cpu_fallback=cfg.allow_cpu_fallback,
-            mode_label="mode [1] Training/testing",
-        )
-        logging.info("Mode [1]: Training/testing (load tuned hyperparameters when available)")
-        run_train_test_mode(cfg=cfg, base_df=base_df, require_tuned=False, use_gpu=use_gpu)
-        return
-
-    if mode == "2":
-        logging.info("Mode [2]: Inference only")
+    elif mode == 1:
+        run_train_test_mode(cfg=cfg, base_df=base_df)
+    elif mode == 2:
         run_inference_only_mode(cfg=cfg, base_df=base_df)
-        return
-
-    raise RuntimeError(f"Unsupported mode selection: {mode}")
+    elif mode == 3:
+        logging.info("Exiting.")
+        raise SystemExit(0)
 
 
 if __name__ == "__main__":
